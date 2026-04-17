@@ -1,0 +1,7 @@
+n8n.dcss.dev {
+    handle /discord/interactions {
+        reverse_proxy 127.0.0.1:8001
+    }
+
+    reverse_proxy 127.0.0.1:5678
+}

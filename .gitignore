@@ -10,3 +10,4 @@ Docker/python-worker/.venv/
 Docker/python-worker/venv/
 
 !.env.example
+!.env.vps.example

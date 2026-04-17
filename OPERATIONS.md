@@ -5,6 +5,9 @@
 - Compose project: `/opt/dcss-n8n/Docker`
 - Compose file: `/opt/dcss-n8n/Docker/docker-compose.vps.yml`
 - Environment file: `/opt/dcss-n8n/Docker/.env`
+- Environment template: `/opt/dcss-n8n/Docker/.env.vps.example`
+- Tracked Caddy reference: `/opt/dcss-n8n/Caddy/Caddyfile`
+- Active Caddy config: `/etc/caddy/Caddyfile`
 - Local backups: `/opt/dcss-n8n/backups`
 - n8n data volume: `docker_n8n_data`
 - Postgres data volume: `docker_postgres_data`
@@ -18,6 +21,8 @@ Caddy serves `https://n8n.dcss.dev`.
 - All other paths proxy to n8n at `127.0.0.1:5678`.
 
 n8n should stay bound to localhost in Docker Compose. Do not publish it on `0.0.0.0`.
+
+The tracked `Caddy/Caddyfile` is a reference copy of the active Caddy config. If `/etc/caddy/Caddyfile` changes, update the tracked copy after verifying that it contains no secrets.
 
 ## Backups
 
