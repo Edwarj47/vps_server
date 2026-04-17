@@ -1,0 +1,12 @@
+.env
+.env.*
+*.bak.*
+*.codex-pre-*
+backups/
+Docker/python-worker/__pycache__/
+Docker/python-worker/*.pyc
+Docker/python-worker/.pytest_cache/
+Docker/python-worker/.venv/
+Docker/python-worker/venv/
+
+!.env.example
