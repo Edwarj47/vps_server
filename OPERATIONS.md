@@ -51,6 +51,29 @@ sudo /opt/dcss-n8n/Docker/health-check-stack.sh
 
 The health check verifies containers, n8n local and Caddy health, Ollama reachability from the Docker network, Discord signature rejection for unsigned requests, and that n8n is not publicly bound on port `5678`.
 
+## Discord Agent MVP
+
+The Discord gateway lives in `/opt/dcss-n8n/Docker/python-worker`.
+
+Supported slash-command names in the Phase 1 router:
+
+- `/status`: read-only health report for n8n, Ollama, and Postgres.
+- `/ask`: stores the prompt in `discord_chat_memory`, forwards to the existing n8n Ollama webhook, then stores the assistant reply.
+- `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
+- `/task`: records a queued job in `agent_jobs`; execution workers are not enabled yet.
+- `/codex`: records an approval-oriented queued job in `agent_jobs`; the Codex bridge is not enabled yet.
+
+The Discord app still needs matching slash commands registered with Discord before users can invoke these names from the client. Unknown commands and legacy interactions continue to fall back to the existing n8n webhook path.
+
+Phase 1 persistence tables:
+
+- `agent_jobs`
+- `agent_tool_calls`
+- `agent_memory_events`
+- `agent_approvals`
+
+The worker creates these tables on startup if they do not exist. Public requests to `/discord/interactions` still require Discord Ed25519 signature verification.
+
 ## Rollback for n8n Localhost Binding
 
 Restore the pre-change compose backup, then recreate n8n:
