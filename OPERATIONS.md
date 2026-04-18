@@ -63,7 +63,16 @@ Supported slash-command names in the Phase 1 router:
 - `/task`: records a queued job in `agent_jobs`; execution workers are not enabled yet.
 - `/codex`: records an approval-oriented queued job in `agent_jobs`; the Codex bridge is not enabled yet.
 
-The Discord app still needs matching slash commands registered with Discord before users can invoke these names from the client. Unknown commands and legacy interactions continue to fall back to the existing n8n webhook path.
+The Discord app needs matching slash commands registered with Discord before users can invoke these names from the client. Unknown commands and legacy interactions continue to fall back to the existing n8n webhook path.
+
+`/ask` is memory-aware as of Phase 1.1:
+
+- The Python router retrieves the last 5 unique prior messages for the Discord session.
+- It also retrieves up to 3 simple text matches from the caller's memory history.
+- The router sends this as `agent_context` to the n8n Ollama workflow.
+- The n8n workflow builds `promptForModel` and the AI Agent uses that instead of the raw prompt.
+
+The current memory retrieval is intentionally small and simple to control latency. It is not yet semantic/vector memory.
 
 Phase 1 persistence tables:
 
@@ -73,6 +82,8 @@ Phase 1 persistence tables:
 - `agent_approvals`
 
 The worker creates these tables on startup if they do not exist. Public requests to `/discord/interactions` still require Discord Ed25519 signature verification.
+
+Tracked workflow exports live under `/opt/dcss-n8n/workflows`.
 
 ## Rollback for n8n Localhost Binding
 

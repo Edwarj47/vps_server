@@ -1,0 +1,615 @@
+[
+  {
+    "updatedAt": "2026-04-18T17:06:29.207Z",
+    "createdAt": "2026-02-12T02:37:23.577Z",
+    "id": "4jxfmYpXsfhFO8Rc",
+    "name": "Ollama Chat Webhook",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "webhook-node",
+        "name": "Chat Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "position": [
+          -480,
+          240
+        ],
+        "webhookId": "dcss-ollama-chat-agent",
+        "parameters": {
+          "path": "ollama-chat-agent",
+          "options": {
+            "rawBody": true
+          },
+          "httpMethod": "POST",
+          "responseMode": "responseNode"
+        },
+        "typeVersion": 2
+      },
+      {
+        "id": "parse-discord-node",
+        "name": "Parse Discord Interaction",
+        "type": "n8n-nodes-base.code",
+        "position": [
+          464,
+          304
+        ],
+        "parameters": {
+          "jsCode": "const source = $input.first()?.json ?? {};\nconst body = source.body ?? {};\nconst headers = source.headers ?? {};\nconst sharedSecret = 'a3f0f935155629c5331e46d8cd29ed0a3ce45b28e455c8371c1fe559744f9470';\n\nfunction getHeaderValue(obj, key) {\n  if (!obj || typeof obj !== 'object') return '';\n  if (obj[key] != null) return String(obj[key]);\n  const lower = key.toLowerCase();\n  for (const [k, v] of Object.entries(obj)) {\n    if (String(k).toLowerCase() === lower) return String(v ?? '');\n  }\n  return '';\n}\n\nfunction extractPrompt(options) {\n  if (!Array.isArray(options)) return '';\n\n  for (const opt of options) {\n    if (typeof opt?.value === 'string' && opt.value.trim()) {\n      return opt.value.trim();\n    }\n\n    if (Array.isArray(opt?.options)) {\n      const nested = extractPrompt(opt.options);\n      if (nested) return nested;\n    }\n  }\n\n  return '';\n}\n\nconst user = body.member?.user ?? body.user ?? {};\nconst userId = user.id || 'anon';\nconst guildId = body.guild_id || null;\nconst channelId = body.channel_id || 'unknown';\nconst isDm = !guildId;\nconst sessionId = isDm\n  ? `discord:dm:${userId}`\n  : `discord:${guildId}:${channelId}:${userId}`;\n\nconst base = {\n  interactionId: body.id || '',\n  interactionToken: body.token || '',\n  applicationId: body.application_id || '',\n  channelId,\n  guildId,\n  userId,\n  username: user.username || user.global_name || 'unknown',\n  isDm,\n  sessionId,\n};\n\nif (sharedSecret) {\n  const received = getHeaderValue(headers, 'x-n8n-shared-secret');\n  if (!received || received !== sharedSecret) {\n    return [{\n      json: {\n        ...base,\n        requestType: 'unauthorized',\n        isUnauthorized: true,\n        isPing: false,\n        hasUsablePrompt: false,\n        prompt: '',\n        promptLen: 0,\n        auditStatus: 'unauthorized',\n        errorDetail: 'shared_secret_mismatch',\n      },\n    }];\n  }\n}\n\nif (body.type === 1) {\n  return [{\n    json: {\n      ...base,\n      requestType: 'ping',\n      isPing: true,\n      isUnauthorized: false,\n      hasUsablePrompt: false,\n      prompt: '',\n      promptLen: 0,\n      auditStatus: 'ping',\n      errorDetail: null,\n    },\n  }];\n}\n\nconst options = Array.isArray(body.data?.options) ? body.data.options : [];\nconst prompt = extractPrompt(options);\nconst normalizedPrompt = String(prompt || '').trim();\nconst hasUsablePrompt = !!normalizedPrompt && normalizedPrompt !== '(no prompt provided)';\nconst agentContext = body.agent_context && typeof body.agent_context === 'object'\n  ? body.agent_context\n  : {};\n\nfunction formatMemoryLines(items) {\n  if (!Array.isArray(items) || items.length === 0) return '';\n  return items\n    .slice(0, 8)\n    .map((item) => {\n      const role = String(item?.role || 'memory').slice(0, 20);\n      const content = String(item?.content || '').replace(/\\s+/g, ' ').trim().slice(0, 600);\n      return content ? `- ${role}: ${content}` : '';\n    })\n    .filter(Boolean)\n    .join('\\n');\n}\n\nfunction buildPromptForModel(currentPrompt, context) {\n  const recent = formatMemoryLines(context.recent_messages);\n  const relevant = formatMemoryLines(context.relevant_memories);\n  const blocks = [];\n\n  blocks.push('You are answering a Discord user. The memory below is trusted context from prior messages in this Discord assistant.');\n\n  if (recent) {\n    blocks.push(`Recent prior messages, oldest to newest:\\n${recent}`);\n  }\n\n  if (relevant) {\n    blocks.push(`Relevant recalled prior messages:\\n${relevant}`);\n  }\n\n  blocks.push(`Current user message:\\n${currentPrompt}`);\n  blocks.push('Answer the current user message directly. If the user asks what they previously asked, what they were talking about, or what something referred to, answer from the prior messages above. Do not say this is a new conversation when prior messages are provided. If the prior messages do not contain the answer, say you do not see it in the supplied memory.');\n\n  return blocks.join('\\n\\n');\n}\n\nif (!hasUsablePrompt) {\n  return [{\n    json: {\n      ...base,\n      requestType: 'no_prompt',\n      isPing: false,\n      isUnauthorized: false,\n      hasUsablePrompt: false,\n      prompt: normalizedPrompt,\n      promptLen: normalizedPrompt.length,\n      chatInput: '',\n      auditStatus: 'no_prompt',\n      errorDetail: 'missing_prompt',\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    ...base,\n    requestType: 'chat',\n    isPing: false,\n    isUnauthorized: false,\n    hasUsablePrompt: true,\n    prompt: normalizedPrompt,\n    promptForModel: buildPromptForModel(normalizedPrompt, agentContext),\n    agentContext,\n    promptLen: normalizedPrompt.length,\n    chatInput: normalizedPrompt,\n    auditStatus: 'chat_pending',\n    errorDetail: null,\n  },\n}];\n"
+        },
+        "typeVersion": 2
+      },
+      {
+        "id": "if-ping-node",
+        "name": "Is Ping?",
+        "type": "n8n-nodes-base.if",
+        "position": [
+          704,
+          304
+        ],
+        "parameters": {
+          "options": {},
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "strict"
+            },
+            "combinator": "and",
+            "conditions": [
+              {
+                "id": "is-ping-condition",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                },
+                "leftValue": "={{ $json.isPing }}",
+                "rightValue": true
+              }
+            ]
+          }
+        },
+        "typeVersion": 2.2
+      },
+      {
+        "id": "ping-response-node",
+        "name": "Build Ping Response",
+        "type": "n8n-nodes-base.code",
+        "position": [
+          928,
+          48
+        ],
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "return { json: { type: 1, auditStatus: 'ping', errorDetail: null, modelUsed: null } };"
+        },
+        "typeVersion": 2
+      },
+      {
+        "id": "ai-agent-node",
+        "name": "AI Agent",
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "onError": "continueRegularOutput",
+        "position": [
+          800,
+          704
+        ],
+        "parameters": {
+          "text": "={{ $json.promptForModel || $json.prompt }}",
+          "options": {
+            "systemMessage": "You are a practical Discord assistant running as a private local-first AI. Keep replies concise, useful, and easy to scan in Discord. Default to short direct answers, ask focused follow-up questions when needed, avoid generic feature lists unless asked, and do not expose internal architecture unless asked. Expand only when the user requests detail. Avoid markdown tables unless they are clearly the best format."
+          },
+          "promptType": "define"
+        },
+        "typeVersion": 3.1
+      },
+      {
+        "id": "ollama-model-node",
+        "name": "Ollama Chat Model",
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "position": [
+          816,
+          896
+        ],
+        "parameters": {
+          "model": "llama3.2:3b",
+          "options": {}
+        },
+        "credentials": {
+          "ollamaApi": {
+            "id": "5At3Gf2sbCgNw6nW",
+            "name": "Ollama Internal"
+          }
+        },
+        "typeVersion": 1
+      },
+      {
+        "id": "build-chat-response-node",
+        "name": "Build Chat Response",
+        "type": "n8n-nodes-base.code",
+        "position": [
+          1232,
+          688
+        ],
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const maxChars = 1900;\nconst maxChunks = 4;\n\nconst candidate =\n  $json.output ??\n  $json.response ??\n  $json.text ??\n  $json.answer ??\n  $json.message ??\n  '';\n\nconst rawError = String($json.error?.message || $json.error || '').trim();\nconst prompt = String($('Parse Discord Interaction').item.json.prompt || '');\nconst askedForTable = /\\b(table|markdown table|tabular)\\b/i.test(prompt);\n\nlet content = String(candidate || '').replace(/\\r\\n/g, '\\n').trim();\n\nif (!content) {\n  if (/timeout|timed out|readtimeout/i.test(rawError)) {\n    content = \"I took too long on that one. Try a shorter prompt, or ask me to continue.\";\n  } else {\n    content = \"I hit an internal error generating that reply. Please retry in a moment.\";\n  }\n}\n\nif (!askedForTable) {\n  content = content.replace(/^\\|.*\\|$/gm, (line) => {\n    const parts = line.split('|').map((s) => s.trim()).filter(Boolean);\n    return parts.length ? `- ${parts.join(' - ')}` : '';\n  });\n}\n\ncontent = content.replace(/\\n{3,}/g, '\\n\\n').trim();\n\nif (!content) {\n  content = \"I couldn't turn that into a Discord-safe reply. Try asking more directly.\";\n}\n\nfunction splitChunks(text, limit) {\n  const chunks = [];\n  let remaining = text;\n\n  while (remaining.length > limit) {\n    let idx = remaining.lastIndexOf('\\n\\n', limit);\n    if (idx < 0 || idx < Math.floor(limit * 0.6)) idx = remaining.lastIndexOf('\\n', limit);\n    if (idx < 0 || idx < Math.floor(limit * 0.6)) idx = limit;\n    chunks.push(remaining.slice(0, idx).trim());\n    remaining = remaining.slice(idx).trim();\n  }\n\n  if (remaining) chunks.push(remaining);\n  return chunks.filter(Boolean);\n}\n\nlet chunks = splitChunks(content, maxChars);\nif (chunks.length === 0) {\n  chunks = [\"I couldn't turn that into a Discord-safe reply. Try asking more directly.\"];\n}\n\nif (chunks.length > maxChunks) {\n  const kept = chunks.slice(0, maxChunks);\n  kept[maxChunks - 1] = `${kept[maxChunks - 1]}\\n\\n[Response truncated. Ask me to continue.]`;\n  chunks = kept;\n}\n\nconst first = chunks[0];\nconst reply = content;\nconst replyForMemory = reply.slice(0, 2800);\nconst modelUsed = String($json.model || 'llama3.2:3b');\nconst auditStatus = rawError ? 'chat_error' : 'chat_success';\n\nreturn {\n  json: {\n    type: 4,\n    data: {\n      content: first,\n    },\n    chunks,\n    reply,\n    replyForMemory,\n    modelUsed,\n    auditStatus,\n    errorDetail: rawError || null,\n  },\n};"
+        },
+        "typeVersion": 2
+      },
+      {
+        "id": "respond-node",
+        "name": "Respond to Discord",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "position": [
+          1504,
+          304
+        ],
+        "parameters": {
+          "options": {},
+          "respondWith": "json",
+          "responseBody": "={{ $json }}"
+        },
+        "typeVersion": 1.4
+      },
+      {
+        "id": "if-unauthorized-node",
+        "name": "Is Unauthorized?",
+        "type": "n8n-nodes-base.if",
+        "position": [
+          624,
+          32
+        ],
+        "parameters": {
+          "options": {},
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "strict"
+            },
+            "combinator": "and",
+            "conditions": [
+              {
+                "id": "is-unauthorized-condition",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                },
+                "leftValue": "={{ $json.requestType }}",
+                "rightValue": "unauthorized"
+              }
+            ]
+          }
+        },
+        "typeVersion": 2.2
+      },
+      {
+        "id": "unauthorized-response-node",
+        "name": "Build Unauthorized Response",
+        "type": "n8n-nodes-base.code",
+        "position": [
+          880,
+          -336
+        ],
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "return { json: { type: 4, data: { content: 'Request rejected by security policy.' }, auditStatus: 'unauthorized', errorDetail: 'shared_secret_mismatch', modelUsed: null } };"
+        },
+        "typeVersion": 2
+      },
+      {
+        "id": "if-prompt-node",
+        "name": "Has Usable Prompt?",
+        "type": "n8n-nodes-base.if",
+        "position": [
+          944,
+          304
+        ],
+        "parameters": {
+          "options": {},
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "strict"
+            },
+            "combinator": "and",
+            "conditions": [
+              {
+                "id": "has-prompt-condition",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                },
+                "leftValue": "={{ $json.hasUsablePrompt }}",
+                "rightValue": true
+              }
+            ]
+          }
+        },
+        "typeVersion": 2.2
+      },
+      {
+        "id": "missing-prompt-response-node",
+        "name": "Build Missing Prompt Response",
+        "type": "n8n-nodes-base.code",
+        "position": [
+          1344,
+          96
+        ],
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "return { json: { type: 4, data: { content: 'Please include a prompt with /chat, for example: /chat prompt: hello' }, auditStatus: 'no_prompt', errorDetail: 'missing_prompt', modelUsed: null } };"
+        },
+        "typeVersion": 2
+      },
+      {
+        "id": "write-user-memory-node",
+        "name": "Write User Memory",
+        "type": "n8n-nodes-base.postgres",
+        "onError": "continueRegularOutput",
+        "position": [
+          992,
+          528
+        ],
+        "parameters": {
+          "query": "INSERT INTO discord_chat_memory (session_id, role, content, guild_id, channel_id, user_id, metadata_json) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb);",
+          "options": {
+            "queryReplacement": "={{ [ $json.sessionId, \"user\", $json.prompt, $json.guildId, $json.channelId, $json.userId, JSON.stringify({ source: \"discord\", interaction_id: $json.interactionId }) ] }}"
+          },
+          "operation": "executeQuery"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "ZqR6SSyvB5h9tbg0",
+            "name": "Postgres Memory Audit"
+          }
+        },
+        "typeVersion": 2.5
+      },
+      {
+        "id": "write-assistant-memory-node",
+        "name": "Write Assistant Memory",
+        "type": "n8n-nodes-base.postgres",
+        "onError": "continueRegularOutput",
+        "position": [
+          1504,
+          768
+        ],
+        "parameters": {
+          "query": "INSERT INTO discord_chat_memory (session_id, role, content, guild_id, channel_id, user_id, metadata_json) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb);",
+          "options": {
+            "queryReplacement": "={{ [ $(\"Parse Discord Interaction\").item.json.sessionId, \"assistant\", ($json.replyForMemory || $json.reply || $json.data?.content || \"\"), $(\"Parse Discord Interaction\").item.json.guildId, $(\"Parse Discord Interaction\").item.json.channelId, $(\"Parse Discord Interaction\").item.json.userId, JSON.stringify({ source: \"discord\", interaction_id: $(\"Parse Discord Interaction\").item.json.interactionId }) ] }}"
+          },
+          "operation": "executeQuery"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "ZqR6SSyvB5h9tbg0",
+            "name": "Postgres Memory Audit"
+          }
+        },
+        "typeVersion": 2.5
+      },
+      {
+        "id": "write-audit-chat-node",
+        "name": "Write Audit Chat",
+        "type": "n8n-nodes-base.postgres",
+        "onError": "continueRegularOutput",
+        "position": [
+          1696,
+          528
+        ],
+        "parameters": {
+          "query": "INSERT INTO discord_interaction_audit (interaction_id, user_id, guild_id, channel_id, session_id, status, prompt_len, model, error_detail) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);",
+          "options": {
+            "queryReplacement": "={{ [ $(\"Parse Discord Interaction\").item.json.interactionId, $(\"Parse Discord Interaction\").item.json.userId, $(\"Parse Discord Interaction\").item.json.guildId, $(\"Parse Discord Interaction\").item.json.channelId, $(\"Parse Discord Interaction\").item.json.sessionId, ($json.auditStatus || \"chat_unknown\"), $(\"Parse Discord Interaction\").item.json.promptLen || 0, ($json.modelUsed || null), ($json.errorDetail || null) ] }}"
+          },
+          "operation": "executeQuery"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "ZqR6SSyvB5h9tbg0",
+            "name": "Postgres Memory Audit"
+          }
+        },
+        "typeVersion": 2.5
+      },
+      {
+        "id": "write-audit-ping-node",
+        "name": "Write Audit Ping",
+        "type": "n8n-nodes-base.postgres",
+        "onError": "continueRegularOutput",
+        "position": [
+          1056,
+          176
+        ],
+        "parameters": {
+          "query": "INSERT INTO discord_interaction_audit (interaction_id, user_id, guild_id, channel_id, session_id, status, prompt_len, model, error_detail) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);",
+          "options": {
+            "queryReplacement": "={{ [ $(\"Parse Discord Interaction\").item.json.interactionId, $(\"Parse Discord Interaction\").item.json.userId, $(\"Parse Discord Interaction\").item.json.guildId, $(\"Parse Discord Interaction\").item.json.channelId, $(\"Parse Discord Interaction\").item.json.sessionId, \"ping\", 0, null, null ] }}"
+          },
+          "operation": "executeQuery"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "ZqR6SSyvB5h9tbg0",
+            "name": "Postgres Memory Audit"
+          }
+        },
+        "typeVersion": 2.5
+      },
+      {
+        "id": "write-audit-unauthorized-node",
+        "name": "Write Audit Unauthorized",
+        "type": "n8n-nodes-base.postgres",
+        "onError": "continueRegularOutput",
+        "position": [
+          912,
+          -96
+        ],
+        "parameters": {
+          "query": "INSERT INTO discord_interaction_audit (interaction_id, user_id, guild_id, channel_id, session_id, status, prompt_len, model, error_detail) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);",
+          "options": {
+            "queryReplacement": "={{ [ $(\"Parse Discord Interaction\").item.json.interactionId, $(\"Parse Discord Interaction\").item.json.userId, $(\"Parse Discord Interaction\").item.json.guildId, $(\"Parse Discord Interaction\").item.json.channelId, $(\"Parse Discord Interaction\").item.json.sessionId, \"unauthorized\", 0, null, \"shared_secret_mismatch\" ] }}"
+          },
+          "operation": "executeQuery"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "ZqR6SSyvB5h9tbg0",
+            "name": "Postgres Memory Audit"
+          }
+        },
+        "typeVersion": 2.5
+      },
+      {
+        "id": "write-audit-missing-prompt-node",
+        "name": "Write Audit Missing Prompt",
+        "type": "n8n-nodes-base.postgres",
+        "onError": "continueRegularOutput",
+        "position": [
+          1616,
+          0
+        ],
+        "parameters": {
+          "query": "INSERT INTO discord_interaction_audit (interaction_id, user_id, guild_id, channel_id, session_id, status, prompt_len, model, error_detail) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);",
+          "options": {
+            "queryReplacement": "={{ [ $(\"Parse Discord Interaction\").item.json.interactionId, $(\"Parse Discord Interaction\").item.json.userId, $(\"Parse Discord Interaction\").item.json.guildId, $(\"Parse Discord Interaction\").item.json.channelId, $(\"Parse Discord Interaction\").item.json.sessionId, \"no_prompt\", $(\"Parse Discord Interaction\").item.json.promptLen || 0, null, \"missing_prompt\" ] }}"
+          },
+          "operation": "executeQuery"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "ZqR6SSyvB5h9tbg0",
+            "name": "Postgres Memory Audit"
+          }
+        },
+        "typeVersion": 2.5
+      }
+    ],
+    "connections": {
+      "Chat Webhook": {
+        "main": [
+          [
+            {
+              "node": "Parse Discord Interaction",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Discord Interaction": {
+        "main": [
+          [
+            {
+              "node": "Is Unauthorized?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Unauthorized?": {
+        "main": [
+          [
+            {
+              "node": "Build Unauthorized Response",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Is Ping?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Unauthorized Response": {
+        "main": [
+          [
+            {
+              "node": "Respond to Discord",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Write Audit Unauthorized",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Ping?": {
+        "main": [
+          [
+            {
+              "node": "Build Ping Response",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Has Usable Prompt?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Ping Response": {
+        "main": [
+          [
+            {
+              "node": "Respond to Discord",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Write Audit Ping",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Has Usable Prompt?": {
+        "main": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Write User Memory",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Build Missing Prompt Response",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Missing Prompt Response": {
+        "main": [
+          [
+            {
+              "node": "Respond to Discord",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Write Audit Missing Prompt",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "AI Agent": {
+        "main": [
+          [
+            {
+              "node": "Build Chat Response",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Chat Response": {
+        "main": [
+          [
+            {
+              "node": "Respond to Discord",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Write Assistant Memory",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Write Audit Chat",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "callerPolicy": "workflowsFromSameOwner",
+      "availableInMCP": false,
+      "timeSavedMode": "fixed",
+      "executionOrder": "v0",
+      "binaryMode": "separate"
+    },
+    "staticData": null,
+    "meta": {
+      "templateCredsSetupCompleted": true
+    },
+    "pinData": {},
+    "versionId": "24f068c5-31b1-4b46-8ff4-15a8f4637616",
+    "activeVersionId": "1dc7aba6-2073-4789-824a-5c69541e63a2",
+    "versionCounter": 131,
+    "triggerCount": 1,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-02-12T02:37:23.577Z",
+        "createdAt": "2026-02-12T02:37:23.577Z",
+        "role": "workflow:owner",
+        "workflowId": "4jxfmYpXsfhFO8Rc",
+        "projectId": "CLm0wry3VSoyAdqp",
+        "project": {
+          "updatedAt": "2026-02-12T00:54:16.644Z",
+          "createdAt": "2026-02-12T00:31:32.258Z",
+          "id": "CLm0wry3VSoyAdqp",
+          "name": "JACOB EDWARDS <jacobedwards1221@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "creatorId": "f91417d3-7787-4047-9878-1386579fc295"
+        }
+      }
+    ]
+  }
+]

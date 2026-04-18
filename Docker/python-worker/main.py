@@ -33,6 +33,8 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "").strip()
 
 N8N_INTERNAL_HEALTH_URL = os.getenv("N8N_INTERNAL_HEALTH_URL", "http://n8n:5678/healthz")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+RECENT_MEMORY_LIMIT = int(os.getenv("RECENT_MEMORY_LIMIT", "5"))
+RELEVANT_MEMORY_LIMIT = int(os.getenv("RELEVANT_MEMORY_LIMIT", "3"))
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -392,6 +394,80 @@ async def _record_memory_event(ctx: dict[str, str], event_type: str, content: st
         )
 
 
+async def _recent_memory(ctx: dict[str, str], limit: int = RECENT_MEMORY_LIMIT) -> list[dict[str, str]]:
+    if DB_POOL is None:
+        return []
+
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select role, content, max(created_at) as created_at
+            from discord_chat_memory
+            where session_id = $1
+            group by role, content
+            order by created_at desc
+            limit $2
+            """,
+            _session_id(ctx),
+            max(1, min(limit, 10)),
+        )
+
+    return [
+        {
+            "role": str(row["role"]),
+            "content": " ".join(str(row["content"]).split())[:600],
+            "created_at": row["created_at"].isoformat(),
+        }
+        for row in reversed(rows)
+    ]
+
+
+async def _relevant_memory(ctx: dict[str, str], prompt: str, limit: int = RELEVANT_MEMORY_LIMIT) -> list[dict[str, str]]:
+    if DB_POOL is None:
+        return []
+    query = prompt.strip()
+    if len(query) < 3:
+        return []
+
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select role, content, max(created_at) as created_at
+            from discord_chat_memory
+            where user_id = $1 and content ilike '%' || $2 || '%'
+            group by role, content
+            order by created_at desc
+            limit $3
+            """,
+            ctx["user_id"] or "unknown",
+            query[:200],
+            max(1, min(limit, 5)),
+        )
+
+    return [
+        {
+            "role": str(row["role"]),
+            "content": " ".join(str(row["content"]).split())[:600],
+            "created_at": row["created_at"].isoformat(),
+        }
+        for row in rows
+    ]
+
+
+async def _build_agent_context(ctx: dict[str, str], prompt: str) -> dict[str, Any]:
+    recent, relevant = await asyncio.gather(
+        _recent_memory(ctx),
+        _relevant_memory(ctx, prompt),
+    )
+    return {
+        "memory_version": 1,
+        "recent_limit": RECENT_MEMORY_LIMIT,
+        "relevant_limit": RELEVANT_MEMORY_LIMIT,
+        "recent_messages": recent,
+        "relevant_memories": relevant,
+    }
+
+
 async def _check_http_json(name: str, url: str) -> tuple[str, bool, str]:
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -425,15 +501,19 @@ async def _status_report() -> str:
     return "\n".join(lines)
 
 
-async def _forward_to_n8n(raw_body: bytes) -> str:
+async def _forward_to_n8n(raw_body: bytes, agent_context: dict[str, Any] | None = None) -> str:
     headers = {"content-type": "application/json"}
     if N8N_WEBHOOK_SHARED_SECRET:
         headers["x-n8n-shared-secret"] = N8N_WEBHOOK_SHARED_SECRET
 
+    body = json.loads(raw_body)
+    if agent_context is not None:
+        body["agent_context"] = agent_context
+
     async with httpx.AsyncClient(timeout=N8N_PROXY_TIMEOUT_SEC) as client:
         n8n_resp = await client.post(
             N8N_WEBHOOK_URL,
-            content=raw_body,
+            content=json.dumps(body).encode("utf-8"),
             headers=headers,
         )
         logger.info("n8n forward status=%s", n8n_resp.status_code)
@@ -499,7 +579,8 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
         elif command == "ask" or not command:
             # The existing n8n workflow already persists chat turns in
             # discord_chat_memory. Avoid double-writing the same prompt/reply here.
-            content = await _forward_to_n8n(raw_body)
+            agent_context = await _build_agent_context(ctx, prompt) if prompt else None
+            content = await _forward_to_n8n(raw_body, agent_context)
         else:
             content = await _forward_to_n8n(raw_body)
 
