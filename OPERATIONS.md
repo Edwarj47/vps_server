@@ -59,6 +59,7 @@ Supported slash-command names in the Phase 1 router:
 
 - `/status`: read-only health report for n8n, Ollama, and Postgres.
 - `/ask`: forwards to the existing n8n Ollama webhook with router-supplied memory context. The n8n workflow remains the single writer for chat memory.
+- `/research`: performs constrained web research with source URLs, public HTTP(S) only, private-network blocking, byte/time/source limits, and `agent_tool_calls` audit records.
 - `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
 - `/task`: records a queued job in `agent_jobs`; execution workers are not enabled yet.
 - `/codex`: records an approval-oriented queued job in `agent_jobs`; the Codex bridge is not enabled yet.
@@ -87,6 +88,14 @@ Phase 1 persistence tables:
 The worker creates these tables on startup if they do not exist. Public requests to `/discord/interactions` still require Discord Ed25519 signature verification.
 
 Tracked workflow exports live under `/opt/dcss-n8n/workflows`.
+
+Register Discord slash commands with:
+
+```bash
+DISCORD_APPLICATION_ID=... DISCORD_GUILD_ID=... DISCORD_BOT_TOKEN=... /opt/dcss-n8n/scripts/register-discord-commands.sh
+```
+
+Do not store the Discord bot token in this script or in git-tracked files.
 
 ## Rollback for n8n Localhost Binding
 

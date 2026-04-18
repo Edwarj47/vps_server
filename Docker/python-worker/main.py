@@ -2,8 +2,12 @@ import asyncio
 import json
 import logging
 import os
+import re
+import socket
 import time
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from typing import Any
 
 import asyncpg
@@ -35,6 +39,15 @@ N8N_INTERNAL_HEALTH_URL = os.getenv("N8N_INTERNAL_HEALTH_URL", "http://n8n:5678/
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 RECENT_MEMORY_LIMIT = int(os.getenv("RECENT_MEMORY_LIMIT", "5"))
 RELEVANT_MEMORY_LIMIT = int(os.getenv("RELEVANT_MEMORY_LIMIT", "3"))
+RESEARCH_SEARCH_URL = os.getenv("RESEARCH_SEARCH_URL", "https://duckduckgo.com/html/")
+RESEARCH_USER_AGENT = os.getenv(
+    "RESEARCH_USER_AGENT",
+    "Mozilla/5.0 (compatible; dcss-discord-agent/0.1; +https://n8n.dcss.dev)",
+)
+RESEARCH_MAX_RESULTS = int(os.getenv("RESEARCH_MAX_RESULTS", "4"))
+RESEARCH_MAX_FETCHES = int(os.getenv("RESEARCH_MAX_FETCHES", "3"))
+RESEARCH_TIMEOUT_SEC = float(os.getenv("RESEARCH_TIMEOUT_SEC", "8"))
+RESEARCH_MAX_BYTES = int(os.getenv("RESEARCH_MAX_BYTES", "300000"))
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -47,6 +60,31 @@ except ValueError as exc:
     raise RuntimeError("DISCORD_PUBLIC_KEY must be valid hex Ed25519") from exc
 
 DB_POOL: asyncpg.Pool | None = None
+
+
+PRIVATE_HOSTS = {"localhost", "0.0.0.0"}
+PRIVATE_NET_PREFIXES = (
+    "10.",
+    "127.",
+    "169.254.",
+    "172.16.",
+    "172.17.",
+    "172.18.",
+    "172.19.",
+    "172.20.",
+    "172.21.",
+    "172.22.",
+    "172.23.",
+    "172.24.",
+    "172.25.",
+    "172.26.",
+    "172.27.",
+    "172.28.",
+    "172.29.",
+    "172.30.",
+    "172.31.",
+    "192.168.",
+)
 
 
 @asynccontextmanager
@@ -188,6 +226,171 @@ def _extract_content(n8n_body: Any) -> str:
                 return data[key].strip()
 
     return "Sorry, I could not generate a response right now."
+
+
+class _DuckDuckGoParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self._in_result_link = False
+        self._in_snippet = False
+        self._current_href = ""
+        self._current_text: list[str] = []
+        self._snippet_href = ""
+        self._snippet_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {k: v or "" for k, v in attrs}
+        if tag == "a" and "result__a" in attr.get("class", ""):
+            self._in_result_link = True
+            self._current_href = attr.get("href", "")
+            self._current_text = []
+        elif tag == "a" and "result__snippet" in attr.get("class", ""):
+            self._in_snippet = True
+            self._snippet_href = attr.get("href", "")
+            self._snippet_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_result_link:
+            self._current_text.append(data)
+        elif self._in_snippet:
+            self._snippet_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._in_result_link:
+            title = " ".join(" ".join(self._current_text).split())
+            url = _normalize_search_url(self._current_href)
+            if title and url:
+                self.results.append({"title": title[:180], "url": url, "snippet": ""})
+            self._in_result_link = False
+            self._current_href = ""
+            self._current_text = []
+        elif tag == "a" and self._in_snippet:
+            snippet = " ".join(" ".join(self._snippet_text).split())
+            url = _normalize_search_url(self._snippet_href)
+            for result in reversed(self.results):
+                if result["url"] == url:
+                    result["snippet"] = snippet[:500]
+                    break
+            self._in_snippet = False
+            self._snippet_href = ""
+            self._snippet_text = []
+
+
+class _ReadableTextParser(HTMLParser):
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "canvas", "form", "nav", "footer"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag in {"p", "br", "li", "h1", "h2", "h3", "h4", "tr"} and self._skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag in {"p", "li", "h1", "h2", "h3", "h4", "tr"} and self._skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            text = " ".join(data.split())
+            if text:
+                self.parts.append(text)
+
+    def text(self) -> str:
+        raw = " ".join(self.parts)
+        raw = re.sub(r"\s+", " ", raw)
+        raw = re.sub(r"\s+([,.;:!?])", r"\1", raw)
+        return raw.strip()
+
+
+def _normalize_search_url(href: str) -> str:
+    if not href:
+        return ""
+    if href.startswith("//duckduckgo.com/l/"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    if "duckduckgo.com" in parsed.netloc and parsed.query:
+        uddg = parse_qs(parsed.query).get("uddg")
+        if uddg:
+            return unquote(uddg[0])
+    return href
+
+
+def _host_is_blocked(hostname: str) -> bool:
+    host = hostname.strip().lower().rstrip(".")
+    if not host or host in PRIVATE_HOSTS or host.endswith(".local"):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return True
+    for info in infos:
+        ip = info[4][0]
+        if ip == "::1" or ip.startswith("fc") or ip.startswith("fd") or ip.startswith("fe80:"):
+            return True
+        if ip.startswith(PRIVATE_NET_PREFIXES):
+            return True
+    return False
+
+
+def _safe_research_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if not parsed.hostname or _host_is_blocked(parsed.hostname):
+        return ""
+    return url
+
+
+def _clean_source_text(html: str) -> str:
+    parser = _ReadableTextParser()
+    parser.feed(html)
+    return parser.text()[:5000]
+
+
+def _extract_relevant_sentences(query: str, text: str, limit: int = 3) -> list[str]:
+    terms = {
+        term
+        for term in re.findall(r"[a-z0-9]{4,}", query.lower())
+        if term not in {"what", "where", "when", "best", "tell", "about", "with", "from", "that"}
+    }
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    scored: list[tuple[int, str]] = []
+    for sentence in sentences:
+        cleaned = " ".join(sentence.split())
+        if len(cleaned) < 40:
+            continue
+        score = sum(1 for term in terms if term in cleaned.lower())
+        if score:
+            scored.append((score, cleaned[:280]))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [sentence for _, sentence in scored[:limit]]
+
+
+def _format_research_response(query: str, sources: list[dict[str, Any]], elapsed_ms: float) -> str:
+    usable = [source for source in sources if source.get("facts")]
+    if not usable:
+        return (
+            "I could not find enough usable web text for that research request. "
+            "Try a more specific query or include the city, state, or official site."
+        )
+
+    lines = [f"Research results for: {query}", ""]
+    for idx, source in enumerate(usable, start=1):
+        lines.append(f"{idx}. {source['title']}")
+        for fact in source["facts"][:2]:
+            lines.append(f"   - {fact}")
+        lines.append(f"   Source: {source['url']}")
+    lines.append("")
+    lines.append(f"Checked {len(sources)} source(s) in {elapsed_ms / 1000:.1f}s. Web content is untrusted; verify before acting.")
+    return "\n".join(lines)[:1900]
 
 
 def _discord_context(payload: dict) -> dict[str, str]:
@@ -440,6 +643,121 @@ async def _record_memory_event(ctx: dict[str, str], event_type: str, content: st
         )
 
 
+async def _search_web(query: str) -> list[dict[str, str]]:
+    safe_query = " ".join(query.split())[:200]
+    if len(safe_query) < 3:
+        return []
+
+    url = f"{RESEARCH_SEARCH_URL}?q={quote_plus(safe_query)}"
+    headers = {"user-agent": RESEARCH_USER_AGENT}
+    async with httpx.AsyncClient(
+        timeout=RESEARCH_TIMEOUT_SEC,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        html = resp.text[:RESEARCH_MAX_BYTES]
+
+    parser = _DuckDuckGoParser()
+    parser.feed(html)
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for result in parser.results:
+        safe_url = _safe_research_url(result["url"])
+        if not safe_url or safe_url in seen:
+            continue
+        seen.add(safe_url)
+        results.append({"title": result["title"], "url": safe_url, "snippet": result.get("snippet", "")})
+        if len(results) >= max(1, min(RESEARCH_MAX_RESULTS, 8)):
+            break
+    return results
+
+
+async def _fetch_research_source(client: httpx.AsyncClient, query: str, result: dict[str, str]) -> dict[str, Any]:
+    source: dict[str, Any] = {
+        "title": result["title"],
+        "url": result["url"],
+        "snippet": result.get("snippet", ""),
+        "status": "failed",
+        "facts": [result["snippet"]] if result.get("snippet") else [],
+    }
+    try:
+        resp = await client.get(result["url"])
+        source["http_status"] = resp.status_code
+        if resp.status_code >= 400:
+            source["error"] = f"http_{resp.status_code}"
+            if source["facts"]:
+                source["status"] = "snippet_only"
+            return source
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" not in content_type and "text/plain" not in content_type:
+            source["error"] = "unsupported_content_type"
+            if source["facts"]:
+                source["status"] = "snippet_only"
+            return source
+        text = _clean_source_text(resp.text[:RESEARCH_MAX_BYTES])
+        facts = _extract_relevant_sentences(query, text)
+        if source["facts"]:
+            facts = source["facts"] + [fact for fact in facts if fact not in source["facts"]]
+        source["status"] = "completed" if facts else "no_relevant_text"
+        source["facts"] = facts
+        source["text_chars"] = len(text)
+        return source
+    except Exception as exc:
+        source["error"] = type(exc).__name__
+        if source["facts"]:
+            source["status"] = "snippet_only"
+        return source
+
+
+async def _run_web_research(job_id: int | None, query: str) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
+    search_results = await _search_web(query)
+    limited = search_results[: max(1, min(RESEARCH_MAX_FETCHES, 5))]
+
+    async with httpx.AsyncClient(
+        timeout=RESEARCH_TIMEOUT_SEC,
+        follow_redirects=True,
+        headers={"user-agent": RESEARCH_USER_AGENT},
+        limits=httpx.Limits(max_connections=3),
+    ) as client:
+        sources = await asyncio.gather(
+            *[_fetch_research_source(client, query, result) for result in limited]
+        )
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    metadata = {
+        "research_ms": elapsed_ms,
+        "search_results": len(search_results),
+        "sources_checked": len(sources),
+        "sources_with_facts": sum(1 for source in sources if source.get("facts")),
+    }
+    await _record_tool_call(
+        job_id,
+        "web_research",
+        "completed",
+        input_json={
+            "query_chars": len(query),
+            "max_results": RESEARCH_MAX_RESULTS,
+            "max_fetches": RESEARCH_MAX_FETCHES,
+        },
+        output_json={
+            **metadata,
+            "sources": [
+                {
+                    "title": source.get("title"),
+                    "url": source.get("url"),
+                    "status": source.get("status"),
+                    "http_status": source.get("http_status"),
+                }
+                for source in sources
+            ],
+        },
+    )
+    return _format_research_response(query, sources, elapsed_ms), metadata
+
+
 async def _recent_memory(ctx: dict[str, str], limit: int = RECENT_MEMORY_LIMIT) -> list[dict[str, str]]:
     if DB_POOL is None:
         return []
@@ -628,6 +946,12 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
         elif command == "memory":
             content = await _search_memory(ctx, prompt)
             await _record_memory_event(ctx, "search", prompt, {"command": command})
+        elif command == "research":
+            if len(prompt) < 3:
+                content = "Give me at least 3 characters to research."
+            else:
+                content, research_metrics = await _run_web_research(job_id, prompt)
+                await _update_job_metadata(job_id, {"research": research_metrics})
         elif command in {"task", "codex"}:
             await _finish_job(job_id, "queued", "Queued for future worker implementation.")
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
@@ -704,6 +1028,12 @@ async def agent_status() -> dict:
         "n8n_health_url": N8N_INTERNAL_HEALTH_URL,
         "ollama_base_url": OLLAMA_BASE_URL,
     }
+
+
+@app.get("/agent/research")
+async def agent_research(q: str):
+    content, metadata = await _run_web_research(None, q)
+    return {"ok": True, "metadata": metadata, "content": content}
 
 
 @app.post("/discord/interactions")
