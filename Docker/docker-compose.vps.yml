@@ -59,6 +59,7 @@ services:
       N8N_PROTOCOL: ${N8N_PROTOCOL}
       WEBHOOK_URL: ${WEBHOOK_URL}
       N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL}
+      N8N_WEBHOOK_SHARED_SECRET: ${N8N_WEBHOOK_SHARED_SECRET}
       TZ: ${TZ}
     volumes:
       - n8n_data:/home/node/.n8n

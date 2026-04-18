@@ -58,7 +58,7 @@ The Discord gateway lives in `/opt/dcss-n8n/Docker/python-worker`.
 Supported slash-command names in the Phase 1 router:
 
 - `/status`: read-only health report for n8n, Ollama, and Postgres.
-- `/ask`: stores the prompt in `discord_chat_memory`, forwards to the existing n8n Ollama webhook, then stores the assistant reply.
+- `/ask`: forwards to the existing n8n Ollama webhook with router-supplied memory context. The n8n workflow remains the single writer for chat memory.
 - `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
 - `/task`: records a queued job in `agent_jobs`; execution workers are not enabled yet.
 - `/codex`: records an approval-oriented queued job in `agent_jobs`; the Codex bridge is not enabled yet.
@@ -71,8 +71,11 @@ The Discord app needs matching slash commands registered with Discord before use
 - It also retrieves up to 3 simple text matches from the caller's memory history.
 - The router sends this as `agent_context` to the n8n Ollama workflow.
 - The n8n workflow builds `promptForModel` and the AI Agent uses that instead of the raw prompt.
+- The router records `/ask` timing under `agent_jobs.metadata_json.timing` and writes a `n8n_ollama_chat` row to `agent_tool_calls`.
 
 The current memory retrieval is intentionally small and simple to control latency. It is not yet semantic/vector memory.
+
+The n8n workflow validates `x-n8n-shared-secret` from the `N8N_WEBHOOK_SHARED_SECRET` environment variable. Do not hardcode this value in workflow JSON or scripts. Rotate it after any suspected exposure, then recreate both `n8n` and `python-worker`.
 
 Phase 1 persistence tables:
 

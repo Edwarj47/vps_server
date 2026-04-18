@@ -291,6 +291,52 @@ async def _finish_job(job_id: int | None, status: str, result_summary: str = "")
         )
 
 
+async def _update_job_metadata(job_id: int | None, metadata: dict[str, Any]) -> None:
+    if DB_POOL is None or job_id is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            update agent_jobs
+            set metadata_json = metadata_json || $2::jsonb, updated_at = now()
+            where id = $1
+            """,
+            job_id,
+            json.dumps(metadata),
+        )
+
+
+async def _record_tool_call(
+    job_id: int | None,
+    tool_name: str,
+    status: str,
+    *,
+    classification: str = "read_only",
+    input_json: dict[str, Any] | None = None,
+    output_json: dict[str, Any] | None = None,
+    error_detail: str = "",
+) -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            insert into agent_tool_calls (
+                job_id, tool_name, classification, status, input_json,
+                output_json, error_detail, completed_at
+            )
+            values ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, case when $4 in ('completed', 'failed') then now() else null end)
+            """,
+            job_id,
+            tool_name,
+            classification,
+            status,
+            json.dumps(input_json or {}),
+            json.dumps(output_json or {}),
+            error_detail[:2000],
+        )
+
+
 async def _audit_interaction(
     ctx: dict[str, str],
     status: str,
@@ -454,18 +500,26 @@ async def _relevant_memory(ctx: dict[str, str], prompt: str, limit: int = RELEVA
     ]
 
 
-async def _build_agent_context(ctx: dict[str, str], prompt: str) -> dict[str, Any]:
+async def _build_agent_context(ctx: dict[str, str], prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    started = time.perf_counter()
     recent, relevant = await asyncio.gather(
         _recent_memory(ctx),
         _relevant_memory(ctx, prompt),
     )
-    return {
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    context = {
         "memory_version": 1,
         "recent_limit": RECENT_MEMORY_LIMIT,
         "relevant_limit": RELEVANT_MEMORY_LIMIT,
         "recent_messages": recent,
         "relevant_memories": relevant,
     }
+    metrics = {
+        "memory_ms": elapsed_ms,
+        "recent_count": len(recent),
+        "relevant_count": len(relevant),
+    }
+    return context, metrics
 
 
 async def _check_http_json(name: str, url: str) -> tuple[str, bool, str]:
@@ -501,7 +555,7 @@ async def _status_report() -> str:
     return "\n".join(lines)
 
 
-async def _forward_to_n8n(raw_body: bytes, agent_context: dict[str, Any] | None = None) -> str:
+async def _forward_to_n8n(raw_body: bytes, agent_context: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     headers = {"content-type": "application/json"}
     if N8N_WEBHOOK_SHARED_SECRET:
         headers["x-n8n-shared-secret"] = N8N_WEBHOOK_SHARED_SECRET
@@ -510,15 +564,22 @@ async def _forward_to_n8n(raw_body: bytes, agent_context: dict[str, Any] | None 
     if agent_context is not None:
         body["agent_context"] = agent_context
 
+    started = time.perf_counter()
     async with httpx.AsyncClient(timeout=N8N_PROXY_TIMEOUT_SEC) as client:
         n8n_resp = await client.post(
             N8N_WEBHOOK_URL,
             content=json.dumps(body).encode("utf-8"),
             headers=headers,
         )
-        logger.info("n8n forward status=%s", n8n_resp.status_code)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.info("n8n forward status=%s elapsed_ms=%s", n8n_resp.status_code, elapsed_ms)
         n8n_resp.raise_for_status()
-        return _extract_content(n8n_resp.json())
+        content = _extract_content(n8n_resp.json())
+        return content, {
+            "n8n_ms": elapsed_ms,
+            "n8n_status": n8n_resp.status_code,
+            "response_chars": len(content),
+        }
 
 
 async def _send_followup(ctx: dict[str, str], content: str) -> None:
@@ -579,10 +640,37 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
         elif command == "ask" or not command:
             # The existing n8n workflow already persists chat turns in
             # discord_chat_memory. Avoid double-writing the same prompt/reply here.
-            agent_context = await _build_agent_context(ctx, prompt) if prompt else None
-            content = await _forward_to_n8n(raw_body, agent_context)
+            command_started = time.perf_counter()
+            agent_context = None
+            metrics: dict[str, Any] = {}
+            if prompt:
+                agent_context, metrics = await _build_agent_context(ctx, prompt)
+            content, n8n_metrics = await _forward_to_n8n(raw_body, agent_context)
+            metrics.update(n8n_metrics)
+            metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
+            logger.info(
+                "ask timing job_id=%s memory_ms=%s n8n_ms=%s total_ms=%s recent=%s relevant=%s",
+                job_id,
+                metrics.get("memory_ms"),
+                metrics.get("n8n_ms"),
+                metrics.get("total_ms"),
+                metrics.get("recent_count"),
+                metrics.get("relevant_count"),
+            )
+            await _update_job_metadata(job_id, {"timing": metrics})
+            await _record_tool_call(
+                job_id,
+                "n8n_ollama_chat",
+                "completed",
+                input_json={
+                    "prompt_chars": len(prompt),
+                    "recent_count": metrics.get("recent_count", 0),
+                    "relevant_count": metrics.get("relevant_count", 0),
+                },
+                output_json=metrics,
+            )
         else:
-            content = await _forward_to_n8n(raw_body)
+            content, _ = await _forward_to_n8n(raw_body)
 
         await _finish_job(job_id, "completed", content)
         await _audit_interaction(ctx, "completed", prompt, model=f"router:{command or 'legacy'}")
