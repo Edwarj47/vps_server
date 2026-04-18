@@ -6,6 +6,7 @@ import re
 import socket
 import time
 from contextlib import asynccontextmanager
+from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from typing import Any
@@ -42,7 +43,7 @@ RELEVANT_MEMORY_LIMIT = int(os.getenv("RELEVANT_MEMORY_LIMIT", "3"))
 RESEARCH_SEARCH_URL = os.getenv("RESEARCH_SEARCH_URL", "https://duckduckgo.com/html/")
 RESEARCH_USER_AGENT = os.getenv(
     "RESEARCH_USER_AGENT",
-    "Mozilla/5.0 (compatible; dcss-discord-agent/0.1; +https://n8n.dcss.dev)",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
 )
 RESEARCH_MAX_RESULTS = int(os.getenv("RESEARCH_MAX_RESULTS", "4"))
 RESEARCH_MAX_FETCHES = int(os.getenv("RESEARCH_MAX_FETCHES", "3"))
@@ -310,6 +311,57 @@ class _ReadableTextParser(HTMLParser):
         return raw.strip()
 
 
+class _StartpageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self._in_title = False
+        self._in_description = False
+        self._current_href = ""
+        self._current_title: list[str] = []
+        self._current_description: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {k: v or "" for k, v in attrs}
+        classes = attr.get("class", "")
+        if tag in {"script", "style", "svg"}:
+            self._skip_depth += 1
+        elif tag == "a" and "result-link" in classes:
+            self._in_title = True
+            self._current_href = attr.get("href", "")
+            self._current_title = []
+            self._current_description = []
+        elif tag == "p" and "description" in classes and self.results:
+            self._in_description = True
+            self._current_description = []
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        if self._in_title:
+            self._current_title.append(data)
+        elif self._in_description:
+            self._current_description.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "svg"} and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag == "a" and self._in_title:
+            title = " ".join(" ".join(self._current_title).split())
+            if title and self._current_href:
+                self.results.append({"title": title[:180], "url": unescape(self._current_href), "snippet": ""})
+            self._in_title = False
+            self._current_href = ""
+            self._current_title = []
+        elif tag == "p" and self._in_description:
+            snippet = " ".join(" ".join(self._current_description).split())
+            if self.results and snippet:
+                self.results[-1]["snippet"] = unescape(snippet[:500])
+            self._in_description = False
+            self._current_description = []
+
+
 def _normalize_search_url(href: str) -> str:
     if not href:
         return ""
@@ -372,6 +424,36 @@ def _extract_relevant_sentences(query: str, text: str, limit: int = 3) -> list[s
             scored.append((score, cleaned[:280]))
     scored.sort(key=lambda item: item[0], reverse=True)
     return [sentence for _, sentence in scored[:limit]]
+
+
+def _normalize_research_query(query: str) -> str:
+    normalized = " ".join(query.lower().split())
+    normalized = normalized.strip(" ?!.")
+    replacements = [
+        (r"^(please\s+)?(can you\s+)?(check|find|look up|search for|research)\s+", ""),
+        (r"^what\s+(are|is)\s+", ""),
+        (r"^the\s+", ""),
+        (r"\bwhat\b", ""),
+        (r"\bare\b", ""),
+        (r"\bis\b", ""),
+        (r"\bin\s+deland\s+florida\b", "deland florida"),
+        (r"\bin\s+deland\s+fl\b", "deland florida"),
+        (r"\btop\s+3\b", "top three"),
+    ]
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized)
+    normalized = re.sub(r"\b(the|are|is|what|check)\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized or " ".join(query.split())
+
+
+def _candidate_research_queries(query: str) -> list[str]:
+    original = " ".join(query.split())[:200]
+    normalized = _normalize_research_query(query)[:200]
+    candidates = [original]
+    if normalized and normalized != original.lower():
+        candidates.append(normalized)
+    return candidates
 
 
 def _format_research_response(query: str, sources: list[dict[str, Any]], elapsed_ms: float) -> str:
@@ -648,30 +730,68 @@ async def _search_web(query: str) -> list[dict[str, str]]:
     if len(safe_query) < 3:
         return []
 
-    url = f"{RESEARCH_SEARCH_URL}?q={quote_plus(safe_query)}"
     headers = {"user-agent": RESEARCH_USER_AGENT}
-    async with httpx.AsyncClient(
-        timeout=RESEARCH_TIMEOUT_SEC,
-        follow_redirects=True,
-        headers=headers,
-    ) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        html = resp.text[:RESEARCH_MAX_BYTES]
+    for candidate in _candidate_research_queries(safe_query):
+        url = f"{RESEARCH_SEARCH_URL}?q={quote_plus(candidate)}"
+        async with httpx.AsyncClient(
+            timeout=RESEARCH_TIMEOUT_SEC,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            html = resp.text[:RESEARCH_MAX_BYTES]
 
-    parser = _DuckDuckGoParser()
-    parser.feed(html)
-    results: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for result in parser.results:
-        safe_url = _safe_research_url(result["url"])
-        if not safe_url or safe_url in seen:
-            continue
-        seen.add(safe_url)
-        results.append({"title": result["title"], "url": safe_url, "snippet": result.get("snippet", "")})
-        if len(results) >= max(1, min(RESEARCH_MAX_RESULTS, 8)):
-            break
-    return results
+        parser = _DuckDuckGoParser()
+        parser.feed(html)
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for result in parser.results:
+            safe_url = _safe_research_url(result["url"])
+            if not safe_url or safe_url in seen:
+                continue
+            seen.add(safe_url)
+            results.append({"title": result["title"], "url": safe_url, "snippet": result.get("snippet", "")})
+            if len(results) >= max(1, min(RESEARCH_MAX_RESULTS, 8)):
+                break
+        if results:
+            if candidate != safe_query:
+                logger.info("research query normalized original=%r candidate=%r", safe_query, candidate)
+            return results
+    return []
+
+
+async def _search_startpage(query: str) -> list[dict[str, str]]:
+    safe_query = " ".join(query.split())[:200]
+    if len(safe_query) < 3:
+        return []
+    headers = {"user-agent": RESEARCH_USER_AGENT}
+    for candidate in _candidate_research_queries(safe_query):
+        async with httpx.AsyncClient(
+            timeout=RESEARCH_TIMEOUT_SEC,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            resp = await client.get("https://www.startpage.com/sp/search", params={"query": candidate})
+            resp.raise_for_status()
+            html = resp.text[:RESEARCH_MAX_BYTES]
+
+        parser = _StartpageParser()
+        parser.feed(html)
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for result in parser.results:
+            safe_url = _safe_research_url(result["url"])
+            if not safe_url or safe_url in seen:
+                continue
+            seen.add(safe_url)
+            results.append({"title": result["title"], "url": safe_url, "snippet": result.get("snippet", "")})
+            if len(results) >= max(1, min(RESEARCH_MAX_RESULTS, 8)):
+                break
+        if results:
+            logger.info("research search backend=startpage results=%s", len(results))
+            return results
+    return []
 
 
 async def _fetch_research_source(client: httpx.AsyncClient, query: str, result: dict[str, str]) -> dict[str, Any]:
@@ -714,6 +834,10 @@ async def _fetch_research_source(client: httpx.AsyncClient, query: str, result: 
 async def _run_web_research(job_id: int | None, query: str) -> tuple[str, dict[str, Any]]:
     started = time.perf_counter()
     search_results = await _search_web(query)
+    search_backend = "duckduckgo"
+    if not search_results:
+        search_results = await _search_startpage(query)
+        search_backend = "startpage"
     limited = search_results[: max(1, min(RESEARCH_MAX_FETCHES, 5))]
 
     async with httpx.AsyncClient(
@@ -729,6 +853,7 @@ async def _run_web_research(job_id: int | None, query: str) -> tuple[str, dict[s
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     metadata = {
         "research_ms": elapsed_ms,
+        "search_backend": search_backend,
         "search_results": len(search_results),
         "sources_checked": len(sources),
         "sources_with_facts": sum(1 for source in sources if source.get("facts")),
