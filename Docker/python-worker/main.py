@@ -350,9 +350,10 @@ async def _search_memory(ctx: dict[str, str], query: str) -> str:
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch(
             """
-            select role, content, created_at
+            select role, content, max(created_at) as created_at
             from discord_chat_memory
             where user_id = $1 and content ilike '%' || $2 || '%'
+            group by role, content
             order by created_at desc
             limit 5
             """,
@@ -463,7 +464,22 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
     ctx = _discord_context(payload)
     command = _command_name(payload)
     prompt = _option_text(payload)
-    job_id = await _insert_job(ctx, command or "legacy", prompt, metadata={"phase": "discord-agent-mvp"})
+    risk_level = "read_only"
+    requires_approval = False
+    if command == "task":
+        risk_level = "safe_write"
+    elif command == "codex":
+        risk_level = "approval_required"
+        requires_approval = True
+
+    job_id = await _insert_job(
+        ctx,
+        command or "legacy",
+        prompt,
+        risk_level=risk_level,
+        requires_approval=requires_approval,
+        metadata={"phase": "discord-agent-mvp"},
+    )
 
     try:
         if command == "status":
@@ -472,20 +488,18 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
             content = await _search_memory(ctx, prompt)
             await _record_memory_event(ctx, "search", prompt, {"command": command})
         elif command in {"task", "codex"}:
-            risk = "approval_required" if command == "codex" else "safe_write"
             await _finish_job(job_id, "queued", "Queued for future worker implementation.")
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
             return (
                 f"Queued `{command}` job"
                 f"{f' #{job_id}' if job_id else ''}.\n"
-                f"Risk class: `{risk}`.\n"
+                f"Risk class: `{risk_level}`.\n"
                 "The Phase 1 router has recorded it, but execution bridge workers are not enabled yet."
             )
         elif command == "ask" or not command:
-            if prompt:
-                await _save_chat_memory(ctx, "user", prompt, {"command": command or "legacy"})
+            # The existing n8n workflow already persists chat turns in
+            # discord_chat_memory. Avoid double-writing the same prompt/reply here.
             content = await _forward_to_n8n(raw_body)
-            await _save_chat_memory(ctx, "assistant", content, {"command": command or "legacy"})
         else:
             content = await _forward_to_n8n(raw_body)
 
