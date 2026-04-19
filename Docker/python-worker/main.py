@@ -5,10 +5,13 @@ import os
 import re
 import socket
 import time
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 from typing import Any
 
 import asyncpg
@@ -58,6 +61,15 @@ RESEARCH_MAX_RESULTS = int(os.getenv("RESEARCH_MAX_RESULTS", "4"))
 RESEARCH_MAX_FETCHES = int(os.getenv("RESEARCH_MAX_FETCHES", "3"))
 RESEARCH_TIMEOUT_SEC = float(os.getenv("RESEARCH_TIMEOUT_SEC", "8"))
 RESEARCH_MAX_BYTES = int(os.getenv("RESEARCH_MAX_BYTES", "300000"))
+DEFAULT_NEWS_FLASH_SOURCES = (
+    "Hacker News Front Page=https://hnrss.org/frontpage;"
+    "Hacker News Best=https://hnrss.org/best;"
+    "OpenAI News=https://openai.com/news/rss.xml;"
+    "Anthropic News=https://www.anthropic.com/news"
+)
+NEWS_FLASH_SOURCES = os.getenv("NEWS_FLASH_SOURCES", "").strip() or DEFAULT_NEWS_FLASH_SOURCES
+NEWS_FLASH_MAX_ITEMS = int(os.getenv("NEWS_FLASH_MAX_ITEMS", "8"))
+NEWS_FLASH_TIMEOUT_SEC = float(os.getenv("NEWS_FLASH_TIMEOUT_SEC", "8"))
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -386,6 +398,46 @@ class _StartpageParser(HTMLParser):
             self._current_description = []
 
 
+class _NewsLinkParser(HTMLParser):
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "canvas", "form"}
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.links: list[dict[str, str]] = []
+        self._skip_depth = 0
+        self._in_link = False
+        self._current_href = ""
+        self._current_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {k: v or "" for k, v in attrs}
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag == "a" and self._skip_depth == 0:
+            href = attr.get("href", "")
+            if href:
+                self._in_link = True
+                self._current_href = href
+                self._current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_link and self._skip_depth == 0:
+            self._current_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag == "a" and self._in_link:
+            title = " ".join(" ".join(self._current_text).split())
+            url = urljoin(self.base_url, unescape(self._current_href))
+            if title and url:
+                self.links.append({"title": unescape(title)[:180], "url": url})
+            self._in_link = False
+            self._current_href = ""
+            self._current_text = []
+
+
 def _normalize_search_url(href: str) -> str:
     if not href:
         return ""
@@ -429,6 +481,233 @@ def _clean_source_text(html: str) -> str:
     parser = _ReadableTextParser()
     parser.feed(html)
     return parser.text()[:5000]
+
+
+def _clean_feed_text(text: str) -> str:
+    cleaned = _clean_source_text(unescape(text or ""))
+    return " ".join(cleaned.split())[:360]
+
+
+def _news_sources() -> list[tuple[str, str]]:
+    sources: list[tuple[str, str]] = []
+    for item in NEWS_FLASH_SOURCES.split(";"):
+        if not item.strip() or "=" not in item:
+            continue
+        name, url = item.split("=", 1)
+        safe_url = _safe_research_url(url.strip())
+        if name.strip() and safe_url:
+            sources.append((name.strip()[:80], safe_url))
+    return sources
+
+
+def _feed_child_text(node: ET.Element, names: tuple[str, ...]) -> str:
+    for name in names:
+        child = node.find(name)
+        if child is not None and child.text:
+            return child.text.strip()
+    for child in list(node):
+        local = child.tag.rsplit("}", 1)[-1].lower()
+        if local in names and child.text:
+            return child.text.strip()
+    return ""
+
+
+def _parse_feed_datetime(value: str) -> float:
+    if not value:
+        return 0
+    try:
+        return parsedate_to_datetime(value).timestamp()
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
+def _parse_news_feed(source_name: str, feed_url: str, body: str) -> list[dict[str, Any]]:
+    root = ET.fromstring(body)
+    nodes = root.findall(".//item")
+    if not nodes:
+        nodes = [node for node in root.findall(".//{*}entry")]
+    items: list[dict[str, Any]] = []
+    for node in nodes[:20]:
+        title = _clean_feed_text(_feed_child_text(node, ("title",)))
+        link = _feed_child_text(node, ("link",))
+        if not link:
+            for child in list(node):
+                if child.tag.rsplit("}", 1)[-1].lower() == "link":
+                    link = child.attrib.get("href", "")
+                    if link:
+                        break
+        summary = _clean_feed_text(_feed_child_text(node, ("description", "summary", "content")))
+        published = _feed_child_text(node, ("pubDate", "published", "updated"))
+        if title and link:
+            items.append(
+                {
+                    "source": source_name,
+                    "title": title[:180],
+                    "url": _safe_research_url(link) or feed_url,
+                    "summary": summary[:360],
+                    "published": published,
+                    "published_ts": _parse_feed_datetime(published),
+                }
+            )
+    return items
+
+
+def _parse_news_html(source_name: str, page_url: str, body: str) -> list[dict[str, Any]]:
+    parser = _NewsLinkParser(page_url)
+    parser.feed(body)
+    page_host = urlparse(page_url).hostname or ""
+    generic_titles = {
+        "about",
+        "blog",
+        "careers",
+        "company",
+        "contact",
+        "developers",
+        "docs",
+        "documentation",
+        "enterprise",
+        "events",
+        "news",
+        "pricing",
+        "privacy",
+        "research",
+        "safety",
+        "terms",
+    }
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in parser.links:
+        title = _clean_feed_text(link.get("title", ""))
+        url = _safe_research_url(link.get("url", ""))
+        if not title or not url or url in seen:
+            continue
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if parsed.hostname != page_host:
+            continue
+        if len(title) < 8 or title.lower() in generic_titles:
+            continue
+        if "anthropic.com" in page_host and "/news/" not in path:
+            continue
+        if "openai.com" in page_host and "/news/" not in path:
+            continue
+        seen.add(url)
+        items.append(
+            {
+                "source": source_name,
+                "title": title[:180],
+                "url": url,
+                "summary": "",
+                "published": "",
+                "published_ts": 0,
+            }
+        )
+        if len(items) >= 12:
+            break
+    return items
+
+
+async def _fetch_news_source(client: httpx.AsyncClient, source_name: str, feed_url: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    detail = {"source": source_name, "url": feed_url, "status": "failed", "items": 0}
+    try:
+        resp = await client.get(feed_url)
+        detail["http_status"] = resp.status_code
+        resp.raise_for_status()
+        body = resp.text[: max(RESEARCH_MAX_BYTES, 1_000_000)]
+        content_type = resp.headers.get("content-type", "")
+        parser = "html" if "html" in content_type.lower() else "feed"
+        try:
+            items = _parse_news_html(source_name, feed_url, body) if parser == "html" else _parse_news_feed(source_name, feed_url, body)
+        except ET.ParseError:
+            parser = "html"
+            items = _parse_news_html(source_name, feed_url, body)
+        detail["parser"] = parser
+        detail["status"] = "completed" if items else "no_items"
+        detail["items"] = len(items)
+        return items, detail
+    except Exception as exc:
+        detail["error"] = type(exc).__name__
+        return [], detail
+
+
+def _select_news_flash_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    max_items = max(1, min(NEWS_FLASH_MAX_ITEMS, 12))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        grouped.setdefault(str(item.get("source") or "Unknown"), []).append(item)
+    for source_items in grouped.values():
+        source_items.sort(key=lambda item: (item.get("published_ts") or 0, item.get("title") or ""), reverse=True)
+    selected: list[dict[str, Any]] = []
+    while len(selected) < max_items:
+        progressed = False
+        for source_items in grouped.values():
+            if not source_items:
+                continue
+            selected.append(source_items.pop(0))
+            progressed = True
+            if len(selected) >= max_items:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _format_news_flash(items: list[dict[str, Any]], details: list[dict[str, Any]], elapsed_ms: float) -> str:
+    if not items:
+        return "News Flash could not fetch usable items from the configured sources."
+
+    lines = ["News Flash", ""]
+    checked = ", ".join(f"{d['source']}:{d['status']}" for d in details)
+    footer = [
+        "",
+        f"Checked {len(details)} feed(s) in {elapsed_ms / 1000:.1f}s. Feed text is untrusted; verify before acting.",
+        f"Feeds: {checked}",
+    ]
+    for idx, item in enumerate(_select_news_flash_items(items), start=1):
+        item_lines = [f"{idx}. {item['title']}"]
+        summary = str(item.get("summary") or "")
+        if summary and not summary.startswith("Article URL:"):
+            item_lines.append(f"   - {summary}")
+        item_lines.append(f"   Source: {item['source']} - {item['url']}")
+        if len("\n".join(lines + item_lines + footer)) > 1900 and idx > 1:
+            break
+        lines.extend(item_lines)
+    lines.extend(footer)
+    return "\n".join(lines)[:1900]
+
+
+async def _run_news_flash(job_id: int | None) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
+    sources = _news_sources()
+    async with httpx.AsyncClient(
+        timeout=NEWS_FLASH_TIMEOUT_SEC,
+        follow_redirects=True,
+        headers={"user-agent": RESEARCH_USER_AGENT},
+        limits=httpx.Limits(max_connections=4),
+    ) as client:
+        results = await asyncio.gather(*[_fetch_news_source(client, name, url) for name, url in sources])
+    items = [item for source_items, _ in results for item in source_items]
+    details = [detail for _, detail in results]
+    items.sort(key=lambda item: (item.get("published_ts") or 0, item.get("title") or ""), reverse=True)
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    metadata = {
+        "news_flash_ms": elapsed_ms,
+        "sources_checked": len(details),
+        "sources_completed": sum(1 for detail in details if detail.get("status") == "completed"),
+        "items_found": len(items),
+    }
+    await _record_tool_call(
+        job_id,
+        "news_flash",
+        "completed",
+        input_json={"source_count": len(sources), "max_items": NEWS_FLASH_MAX_ITEMS},
+        output_json={**metadata, "sources": details},
+    )
+    return _format_news_flash(items, details, elapsed_ms), metadata
 
 
 def _extract_relevant_sentences(query: str, text: str, limit: int = 3) -> list[str]:
@@ -1255,6 +1534,8 @@ def _task_tool_for_prompt(prompt: str) -> str:
     normalized = prompt.lower()
     if re.search(r"\b(codex|ssh|terminal|shell|sudo|docker exec|systemctl|modify files?|edit files?)\b", normalized):
         return "blocked_codex_or_ops"
+    if any(term in normalized for term in ("news flash", "newsflash", "summarize news", "latest news", "hacker news")):
+        return "news_flash"
     if any(term in normalized for term in ("health", "status", "is anything down", "check stack", "service check")):
         return "health_status"
     if any(term in normalized for term in ("research", "search web", "look up", "find current", "web search")):
@@ -1293,6 +1574,13 @@ async def _execute_task_job(job: asyncpg.Record) -> str:
         query = re.sub(r"^(please\s+)?(research|search web|look up|find current)\s+", "", prompt, flags=re.I).strip() or prompt
         content, metadata = await _run_web_research(job_id, query)
         await _update_job_metadata(job_id, {"research": metadata, "worker_tool": tool})
+        await _save_chat_memory(ctx, "user", prompt, {"command": "task", "tool": tool})
+        await _save_chat_memory(ctx, "assistant", content, {"command": "task", "tool": tool, "job_id": job_id})
+        return content
+
+    if tool == "news_flash":
+        content, metadata = await _run_news_flash(job_id)
+        await _update_job_metadata(job_id, {"news_flash": metadata, "worker_tool": tool})
         await _save_chat_memory(ctx, "user", prompt, {"command": "task", "tool": tool})
         await _save_chat_memory(ctx, "assistant", content, {"command": "task", "tool": tool, "job_id": job_id})
         return content
@@ -1336,7 +1624,7 @@ async def _execute_task_job(job: asyncpg.Record) -> str:
     )
     return (
         "I queued that task, but no safe executable tool matched it yet. "
-        "Current Phase 2 tools can run health checks, web research, memory search, and memory notes."
+        "Current Phase 2 tools can run health checks, web research, News Flash, memory search, and memory notes."
     )
 
 
@@ -1434,6 +1722,20 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
     try:
         if command == "status":
             content = await _status_report()
+        elif command == "newsflash":
+            content, news_metrics = await _run_news_flash(job_id)
+            await _update_job_metadata(job_id, {"news_flash": news_metrics})
+            await _save_chat_memory(ctx, "user", "News Flash", {"command": "newsflash"})
+            await _save_chat_memory(
+                ctx,
+                "assistant",
+                content,
+                {
+                    "command": "newsflash",
+                    "job_id": job_id,
+                    "items_found": news_metrics.get("items_found", 0),
+                },
+            )
         elif command == "approve":
             raw_job_id = _option_value(payload, "job_id")
             decision = str(_option_value(payload, "decision") or "").strip()

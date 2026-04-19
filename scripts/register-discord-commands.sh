@@ -44,6 +44,11 @@ curl -fsS \
     ]
   },
   {
+    "name": "newsflash",
+    "description": "Summarize latest tech and AI news",
+    "type": 1
+  },
+  {
     "name": "memory",
     "description": "Search your agent memory",
     "type": 1,

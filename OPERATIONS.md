@@ -127,6 +127,7 @@ Supported slash-command names in the Phase 1 router:
 - `/status`: read-only health report for n8n, Ollama, and Postgres.
 - `/ask`: forwards to the existing n8n Ollama webhook with router-supplied memory context. The n8n workflow remains the single writer for chat memory.
 - `/research`: performs constrained web research with source URLs, public HTTP(S) only, private-network blocking, byte/time/source limits, and `agent_tool_calls` audit records.
+- `/newsflash`: summarizes latest tech and AI feed items from configured RSS/Atom sources. It is deterministic and does not pass feed text through Ollama.
 - `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
 - `/task`: records a queued job in `agent_jobs`; the Phase 2 worker executes allowed internal tools and posts a Discord completion update.
 - `/codex`: records an approval-oriented queued job in `agent_jobs`; the Phase 2 worker creates a pending approval record, but the Codex bridge is not enabled yet.
@@ -201,6 +202,7 @@ Current allowed `/task` tools:
 
 - health/status checks
 - constrained web research
+- News Flash feed summaries
 - memory search
 - memory note storage
 
@@ -212,6 +214,9 @@ Worker tuning environment variables:
 - `AGENT_WORKER_POLL_SEC=3`
 - `AGENT_WORKER_BATCH_SIZE=2`
 - `AGENT_APPROVER_USER_IDS=` optional comma-separated Discord user allowlist. If unset, only the job owner can approve or deny their pending approval.
+- `NEWS_FLASH_SOURCES=` semicolon-separated `Name=https://feed-url` entries.
+- `NEWS_FLASH_MAX_ITEMS=8`
+- `NEWS_FLASH_TIMEOUT_SEC=8`
 
 Tracked workflow exports live under `/opt/dcss-n8n/workflows`.
 
