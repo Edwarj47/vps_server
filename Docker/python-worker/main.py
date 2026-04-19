@@ -904,7 +904,7 @@ async def _recent_memory(ctx: dict[str, str], limit: int = RECENT_MEMORY_LIMIT) 
     return [
         {
             "role": str(row["role"]),
-            "content": " ".join(str(row["content"]).split())[:600],
+            "content": " ".join(str(row["content"]).split())[:1200],
             "created_at": row["created_at"].isoformat(),
         }
         for row in reversed(rows)
@@ -917,6 +917,32 @@ async def _relevant_memory(ctx: dict[str, str], prompt: str, limit: int = RELEVA
     query = prompt.strip()
     if len(query) < 3:
         return []
+
+    followup_research_terms = ("link", "links", "source", "sources", "provided", "options", "recommend", "last message")
+    if any(term in query.lower() for term in followup_research_terms):
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                select role, content, created_at
+                from discord_chat_memory
+                where session_id = $1
+                  and role = 'assistant'
+                  and metadata_json->>'command' = 'research'
+                order by created_at desc
+                limit $2
+                """,
+                _session_id(ctx),
+                max(1, min(limit, 5)),
+            )
+        if rows:
+            return [
+                {
+                    "role": str(row["role"]),
+                    "content": " ".join(str(row["content"]).split())[:1600],
+                    "created_at": row["created_at"].isoformat(),
+                }
+                for row in rows
+            ]
 
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch(
@@ -1077,6 +1103,17 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
             else:
                 content, research_metrics = await _run_web_research(job_id, prompt)
                 await _update_job_metadata(job_id, {"research": research_metrics})
+                await _save_chat_memory(ctx, "user", prompt, {"command": "research"})
+                await _save_chat_memory(
+                    ctx,
+                    "assistant",
+                    content,
+                    {
+                        "command": "research",
+                        "job_id": job_id,
+                        "sources_with_facts": research_metrics.get("sources_with_facts", 0),
+                    },
+                )
         elif command in {"task", "codex"}:
             await _finish_job(job_id, "queued", "Queued for future worker implementation.")
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
