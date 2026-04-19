@@ -41,6 +41,30 @@ The backup script writes:
 
 The backup directory is intended to be root-owned and mode `0700`. Treat all backup artifacts as sensitive because workflow exports and database dumps can contain private operational data.
 
+Backup verification:
+
+```bash
+sudo /opt/dcss-n8n/scripts/verify-backups.sh --latest
+```
+
+The verifier checks SHA-256 manifests, validates the Postgres dump catalog with `pg_restore`, validates workflow JSON, and lists the config archive.
+
+Restore test:
+
+```bash
+sudo /opt/dcss-n8n/scripts/test-postgres-restore.sh --latest
+```
+
+The restore test creates a temporary Postgres database, restores the latest dump into it, checks the restored table count, and drops only that temporary database.
+
+Retention:
+
+```bash
+sudo /opt/dcss-n8n/scripts/backup-retention-report.sh
+```
+
+The retention policy is to keep at least 30 days. Automatic deletion is intentionally disabled; the report only lists candidates older than the policy.
+
 ## Health Checks
 
 Run:
@@ -50,6 +74,41 @@ sudo /opt/dcss-n8n/Docker/health-check-stack.sh
 ```
 
 The health check verifies containers, n8n local and Caddy health, Ollama reachability from the Docker network, Discord signature rejection for unsigned requests, and that n8n is not publicly bound on port `5678`.
+
+Additional Phase 0 checks:
+
+```bash
+/opt/dcss-n8n/scripts/check-caddy-drift.sh
+/opt/dcss-n8n/scripts/check-resource-thresholds.sh
+```
+
+The Caddy drift check compares the tracked Caddyfile with `/etc/caddy/Caddyfile` after formatting both files. The resource check warns on high disk usage or low available memory.
+
+Least-privilege review notes:
+
+- n8n is bound to `127.0.0.1:5678` and runs as `node`.
+- Python worker is bound to `127.0.0.1:8001`, has no mounted volumes, and runs as an unprivileged `app` user.
+- Postgres and Ollama are private on the Docker network with no host-published ports.
+- Postgres init script is mounted read-only.
+- `/opt/dcss-n8n/Docker/.env` is `0600 root:root`; backups are under a `0700 root:root` directory.
+
+## Scheduled Operations
+
+Systemd timers:
+
+- `dcss-n8n-backup.timer`: daily backup, backup verification, and retention report.
+- `dcss-n8n-health.timer`: health check every 15 minutes.
+- `dcss-n8n-resource-check.timer`: disk/RAM threshold check every 15 minutes.
+- `dcss-n8n-caddy-drift.timer`: daily Caddy drift check.
+- `dcss-n8n-restore-test.timer`: weekly Postgres restore test into a temporary database.
+
+Useful commands:
+
+```bash
+systemctl list-timers --all | grep dcss-n8n
+sudo systemctl status dcss-n8n-backup.service
+journalctl -u dcss-n8n-health.service -n 50 --no-pager
+```
 
 ## Discord Agent MVP
 

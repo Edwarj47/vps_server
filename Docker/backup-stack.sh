@@ -52,6 +52,8 @@ tar -czf "$CONFIG_OUT" \
   Docker/docker-compose.vps.yml \
   Docker/.env \
   Docker/init-data.sh \
+  scripts \
+  systemd \
   Docker/python-worker/Dockerfile \
   Docker/python-worker/requirements.txt \
   Docker/python-worker/main.py \

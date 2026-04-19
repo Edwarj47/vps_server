@@ -1,0 +1,7 @@
+[Unit]
+Description=DCSS n8n Caddy config drift check
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dcss-n8n
+ExecStart=/opt/dcss-n8n/scripts/check-caddy-drift.sh

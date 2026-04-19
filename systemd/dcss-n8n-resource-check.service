@@ -1,0 +1,7 @@
+[Unit]
+Description=DCSS n8n stack disk and memory threshold check
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dcss-n8n
+ExecStart=/opt/dcss-n8n/scripts/check-resource-thresholds.sh

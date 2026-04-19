@@ -1,0 +1,10 @@
+[Unit]
+Description=Run DCSS n8n resource threshold check
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

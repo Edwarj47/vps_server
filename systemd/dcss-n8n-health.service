@@ -1,0 +1,9 @@
+[Unit]
+Description=DCSS n8n stack health check
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dcss-n8n
+ExecStart=/opt/dcss-n8n/Docker/health-check-stack.sh

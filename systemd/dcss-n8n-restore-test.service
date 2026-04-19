@@ -1,0 +1,9 @@
+[Unit]
+Description=DCSS n8n Postgres backup restore test
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dcss-n8n
+ExecStart=/opt/dcss-n8n/scripts/test-postgres-restore.sh --latest
