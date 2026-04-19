@@ -106,6 +106,12 @@ Use these gates before changing `OLLAMA_CHAT_MODEL`:
 - Quality score does not regress on memory follow-up, current-info guardrails, tool routing, source synthesis, and prompt-injection resistance.
 - Peak memory leaves enough headroom for n8n, Postgres, and the Python worker.
 
+April 2026 Gemma notes:
+
+- `gemma3n:e4b` was removed after testing. It required about `7.6 GiB` to load and failed on this VPS.
+- `gemma3n:e2b` loaded only after dropping file cache, then peaked around `6.5 GB` during evaluation. It was removed because the RAM headroom is too small for reliable production use.
+- Keep `llama3.2:3b` as the production chat model until a candidate benchmarks with materially better quality and safe memory headroom.
+
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
 The n8n workflow validates `x-n8n-shared-secret` from the `N8N_WEBHOOK_SHARED_SECRET` environment variable. Do not hardcode this value in workflow JSON or scripts. Rotate it after any suspected exposure, then recreate both `n8n` and `python-worker`.
