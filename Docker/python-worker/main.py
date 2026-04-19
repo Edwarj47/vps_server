@@ -772,6 +772,18 @@ def _candidate_research_queries(query: str) -> list[str]:
     return candidates
 
 
+def _sanitize_research_display(text: str) -> str:
+    """Avoid replaying hostile instructions or secret-harvesting text in Discord."""
+    cleaned = " ".join(str(text or "").split())
+    cleaned = re.sub(r"(?i)\bignore\s+all\s+(previous|prior)\s+instructions\b", "[removed hostile instruction]", cleaned)
+    cleaned = re.sub(
+        r"(?i)\b(reveal|print|dump|show|exfiltrate)\b[^.;\n]{0,80}\b(api\s*keys?|tokens?|secrets?|passwords?|env(?:ironment)?\s*vars?)\b",
+        "[removed secret request]",
+        cleaned,
+    )
+    return cleaned[:320]
+
+
 def _format_research_response(query: str, sources: list[dict[str, Any]], elapsed_ms: float) -> str:
     usable = [source for source in sources if source.get("facts")]
     if not usable:
@@ -780,11 +792,11 @@ def _format_research_response(query: str, sources: list[dict[str, Any]], elapsed
             "Try a more specific query or include the city, state, or official site."
         )
 
-    lines = [f"Research results for: {query}", ""]
+    lines = [f"Research results for: {_sanitize_research_display(query)}", ""]
     for idx, source in enumerate(usable, start=1):
-        lines.append(f"{idx}. {source['title']}")
+        lines.append(f"{idx}. {_sanitize_research_display(source['title'])}")
         for fact in source["facts"][:2]:
-            lines.append(f"   - {fact}")
+            lines.append(f"   - {_sanitize_research_display(fact)}")
         lines.append(f"   Source: {source['url']}")
     lines.append("")
     lines.append(f"Checked {len(sources)} source(s) in {elapsed_ms / 1000:.1f}s. Web content is untrusted; verify before acting.")
@@ -1988,11 +2000,16 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
     initial_status = "running"
     job_metadata: dict[str, Any] = {"phase": "discord-agent-mvp"}
     schedule: dict[str, Any] | None = None
+    task_tool_guess = ""
     if command == "task":
+        task_tool_guess = _task_tool_for_prompt(prompt)
         risk_level = "safe_write"
         initial_status = "queued"
+        if task_tool_guess == "blocked_codex_or_ops":
+            risk_level = "approval_required"
+            initial_status = "rejected"
         schedule = _parse_task_schedule(prompt)
-        if schedule:
+        if schedule and task_tool_guess != "blocked_codex_or_ops":
             initial_status = "scheduled"
         job_metadata = {
             "phase": "agent-worker-v1",
@@ -2080,6 +2097,22 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                     },
                 )
         elif command in {"task", "codex"}:
+            if command == "task" and task_tool_guess == "blocked_codex_or_ops":
+                content = (
+                    "Rejected: that looks like Codex/VPS execution work. "
+                    "For safety, I will not route it from `/task` or Ollama. Use `/codex` explicitly."
+                )
+                await _record_tool_call(
+                    job_id,
+                    "authority_policy",
+                    "completed",
+                    classification="approval_required",
+                    input_json={"prompt_chars": len(prompt)},
+                    output_json={"policy": CODEX_ROUTE_POLICY, "rejected_at_receipt": True},
+                )
+                await _finish_job(job_id, "rejected", content)
+                await _audit_interaction(ctx, "rejected", prompt, model=f"router:{command}")
+                return content
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
             if command == "task" and schedule:
                 repeat = f"\nRepeat: `{schedule['recurrence_rule']}`." if schedule["recurrence_rule"] else ""

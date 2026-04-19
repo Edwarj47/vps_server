@@ -37,6 +37,8 @@ sudo jq --arg model "$MODEL" \
   '.[0].nodes |= map(
     if .name == "Ollama Chat Model" then
       (.parameters.model = $model)
+    elif .name == "Parse Discord Interaction" then
+      (.parameters.jsCode |= sub("const configuredModel = [^;]+;"; "const configuredModel = " + ($model|@json) + ";"))
     elif .name == "Build Chat Response" then
       (.parameters.jsCode |= sub("const modelUsed = String\\([^;]+\\);"; "const modelUsed = String(" + ($model|@json) + ");"))
     else
@@ -48,11 +50,14 @@ sudo install -o root -g root -m 0644 "$tmp" "$WORKFLOW_EXPORT"
 rm -f "$tmp"
 
 code="$(sudo jq -r '.[0].nodes[] | select(.name=="Build Chat Response") | .parameters.jsCode' "$WORKFLOW_EXPORT")"
-sudo docker exec -i "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v code="$code" -v model="$MODEL" -v workflow_id="$WORKFLOW_ID" <<'SQL'
+parse_code="$(sudo jq -r '.[0].nodes[] | select(.name=="Parse Discord Interaction") | .parameters.jsCode' "$WORKFLOW_EXPORT")"
+sudo docker exec -i "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v code="$code" -v parse_code="$parse_code" -v model="$MODEL" -v workflow_id="$WORKFLOW_ID" <<'SQL'
 update workflow_entity
 set nodes = (
   select jsonb_agg(
     case
+      when elem->>'name' = 'Parse Discord Interaction'
+        then jsonb_set(elem, '{parameters,jsCode}', to_jsonb(:'parse_code'::text))
       when elem->>'name' = 'Build Chat Response'
         then jsonb_set(elem, '{parameters,jsCode}', to_jsonb(:'code'::text))
       when elem->>'name' = 'Ollama Chat Model'
@@ -69,6 +74,8 @@ update workflow_history
 set nodes = (
   select jsonb_agg(
     case
+      when elem->>'name' = 'Parse Discord Interaction'
+        then jsonb_set(elem, '{parameters,jsCode}', to_jsonb(:'parse_code'::text))
       when elem->>'name' = 'Build Chat Response'
         then jsonb_set(elem, '{parameters,jsCode}', to_jsonb(:'code'::text))
       when elem->>'name' = 'Ollama Chat Model'

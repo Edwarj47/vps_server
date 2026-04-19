@@ -190,7 +190,12 @@ MemPalace sandbox:
 - This path is git-ignored and is not wired into production.
 - The sandbox uses a local virtualenv and a local palace path under `/opt/dcss-n8n/labs/mempalace/palace`.
 - Initial test ingested a sanitized project summary and successfully retrieved the production model change.
-- Do not connect MemPalace to the live agent until redaction, retention, user/project namespaces, backup behavior, and resource limits are reviewed.
+- Pre-production report: `/opt/dcss-n8n/labs/mempalace-preprod-20260419_190534/report.txt`
+- Resource report: `/opt/dcss-n8n/labs/mempalace-resource-20260419_190604/report.txt`
+- Redaction, namespace isolation, backup/restore, and deletion/retention tests passed against sanitized sample data.
+- The resource test ingested 160 sanitized markdown notes in 86.18s, used about 289 MB peak RSS during mining, searched in 1.15s, and produced a 2.9 MB palace directory.
+- The default MemPalace MCP server exposes write/destructive tools such as drawer deletion, drawer updates, diary writes, hook settings, and knowledge-graph mutation. Do not expose the default MCP server directly to the production agent.
+- Production gate: add a read-only MCP proxy/tool allowlist first, keep write tools behind explicit approval, keep hooks disabled, and ingest only redacted copies created by `scripts/mempalace-redact.py`.
 
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
