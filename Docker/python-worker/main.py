@@ -38,6 +38,7 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "").strip()
 
 N8N_INTERNAL_HEALTH_URL = os.getenv("N8N_INTERNAL_HEALTH_URL", "http://n8n:5678/healthz")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 RECENT_MEMORY_LIMIT = int(os.getenv("RECENT_MEMORY_LIMIT", "5"))
 RELEVANT_MEMORY_LIMIT = int(os.getenv("RELEVANT_MEMORY_LIMIT", "3"))
 RESEARCH_SEARCH_URL = os.getenv("RESEARCH_SEARCH_URL", "https://duckduckgo.com/html/")
@@ -1189,6 +1190,7 @@ async def agent_status() -> dict:
         "postgres": DB_POOL is not None,
         "n8n_health_url": N8N_INTERNAL_HEALTH_URL,
         "ollama_base_url": OLLAMA_BASE_URL,
+        "ollama_chat_model": OLLAMA_CHAT_MODEL,
     }
 
 

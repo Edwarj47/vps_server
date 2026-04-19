@@ -76,6 +76,21 @@ The Discord app needs matching slash commands registered with Discord before use
 
 The current memory retrieval is intentionally small and simple to control latency. It is not yet semantic/vector memory.
 
+The chat model is configured with `OLLAMA_CHAT_MODEL` in `/opt/dcss-n8n/Docker/.env`. Use the sync script below so the `.env`, tracked workflow export, and active n8n workflow records all agree:
+
+```bash
+/opt/dcss-n8n/scripts/set-ollama-chat-model.sh llama3.2:3b
+sudo docker compose --env-file /opt/dcss-n8n/Docker/.env -f /opt/dcss-n8n/Docker/docker-compose.vps.yml up -d n8n python-worker
+```
+
+Then verify with `/status` and a short `/ask`.
+
+Smoke-test an installed Ollama model without touching n8n:
+
+```bash
+/opt/dcss-n8n/scripts/ollama-model-smoke-test.sh llama3.2:3b "Say hello in one short sentence."
+```
+
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
 The n8n workflow validates `x-n8n-shared-secret` from the `N8N_WEBHOOK_SHARED_SECRET` environment variable. Do not hardcode this value in workflow JSON or scripts. Rotate it after any suspected exposure, then recreate both `n8n` and `python-worker`.
