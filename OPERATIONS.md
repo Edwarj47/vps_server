@@ -61,8 +61,9 @@ Supported slash-command names in the Phase 1 router:
 - `/ask`: forwards to the existing n8n Ollama webhook with router-supplied memory context. The n8n workflow remains the single writer for chat memory.
 - `/research`: performs constrained web research with source URLs, public HTTP(S) only, private-network blocking, byte/time/source limits, and `agent_tool_calls` audit records.
 - `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
-- `/task`: records a queued job in `agent_jobs`; execution workers are not enabled yet.
-- `/codex`: records an approval-oriented queued job in `agent_jobs`; the Codex bridge is not enabled yet.
+- `/task`: records a queued job in `agent_jobs`; the Phase 2 worker executes allowed internal tools and posts a Discord completion update.
+- `/codex`: records an approval-oriented queued job in `agent_jobs`; the Phase 2 worker creates a pending approval record, but the Codex bridge is not enabled yet.
+- `/approve`: marks a pending approval as approved or denied. Approval does not execute Codex/VPS work until the Codex bridge exists.
 
 The Discord app needs matching slash commands registered with Discord before users can invoke these names from the client. Unknown commands and legacy interactions continue to fall back to the existing n8n webhook path.
 
@@ -124,6 +125,26 @@ Phase 1 persistence tables:
 - `agent_approvals`
 
 The worker creates these tables on startup if they do not exist. Public requests to `/discord/interactions` still require Discord Ed25519 signature verification.
+
+## Phase 2 Worker
+
+The Python worker runs a small background job loop when `AGENT_WORKER_ENABLED=true`.
+
+Current allowed `/task` tools:
+
+- health/status checks
+- constrained web research
+- memory search
+- memory note storage
+
+Unsupported `/task` prompts complete with a safe "no matching tool" response rather than attempting arbitrary execution. `/codex` jobs are moved to `pending_approval` and get an `agent_approvals` row. They do not start a shell, SSH session, or Codex session yet.
+
+Worker tuning environment variables:
+
+- `AGENT_WORKER_ENABLED=true`
+- `AGENT_WORKER_POLL_SEC=3`
+- `AGENT_WORKER_BATCH_SIZE=2`
+- `AGENT_APPROVER_USER_IDS=` optional comma-separated Discord user allowlist. If unset, only the job owner can approve or deny their pending approval.
 
 Tracked workflow exports live under `/opt/dcss-n8n/workflows`.
 

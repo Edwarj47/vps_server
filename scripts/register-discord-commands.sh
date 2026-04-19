@@ -81,6 +81,35 @@ curl -fsS \
         "required": true
       }
     ]
+  },
+  {
+    "name": "approve",
+    "description": "Approve or deny a pending agent job",
+    "type": 1,
+    "options": [
+      {
+        "name": "job_id",
+        "description": "Agent job number",
+        "type": 4,
+        "required": true
+      },
+      {
+        "name": "decision",
+        "description": "Approve or deny the job",
+        "type": 3,
+        "required": true,
+        "choices": [
+          {
+            "name": "approve",
+            "value": "approve"
+          },
+          {
+            "name": "deny",
+            "value": "deny"
+          }
+        ]
+      }
+    ]
   }
 ]
 JSON

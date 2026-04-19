@@ -39,6 +39,14 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "").strip()
 N8N_INTERNAL_HEALTH_URL = os.getenv("N8N_INTERNAL_HEALTH_URL", "http://n8n:5678/healthz")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
+AGENT_WORKER_ENABLED = os.getenv("AGENT_WORKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AGENT_WORKER_POLL_SEC = float(os.getenv("AGENT_WORKER_POLL_SEC", "3"))
+AGENT_WORKER_BATCH_SIZE = int(os.getenv("AGENT_WORKER_BATCH_SIZE", "2"))
+AGENT_APPROVER_USER_IDS = {
+    user_id.strip()
+    for user_id in os.getenv("AGENT_APPROVER_USER_IDS", "").split(",")
+    if user_id.strip()
+}
 RECENT_MEMORY_LIMIT = int(os.getenv("RECENT_MEMORY_LIMIT", "5"))
 RELEVANT_MEMORY_LIMIT = int(os.getenv("RELEVANT_MEMORY_LIMIT", "3"))
 RESEARCH_SEARCH_URL = os.getenv("RESEARCH_SEARCH_URL", "https://duckduckgo.com/html/")
@@ -62,6 +70,7 @@ except ValueError as exc:
     raise RuntimeError("DISCORD_PUBLIC_KEY must be valid hex Ed25519") from exc
 
 DB_POOL: asyncpg.Pool | None = None
+WORKER_TASK: asyncio.Task | None = None
 
 
 PRIVATE_HOSTS = {"localhost", "0.0.0.0"}
@@ -91,8 +100,18 @@ PRIVATE_NET_PREFIXES = (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global WORKER_TASK
     await _init_db_pool()
+    if AGENT_WORKER_ENABLED and DB_POOL is not None:
+        WORKER_TASK = asyncio.create_task(_agent_worker_loop())
+        logger.info("agent worker started poll_sec=%s batch_size=%s", AGENT_WORKER_POLL_SEC, AGENT_WORKER_BATCH_SIZE)
     yield
+    if WORKER_TASK is not None:
+        WORKER_TASK.cancel()
+        try:
+            await WORKER_TASK
+        except asyncio.CancelledError:
+            pass
     if DB_POOL is not None:
         await DB_POOL.close()
 
@@ -196,6 +215,8 @@ async def _ensure_agent_tables(conn: asyncpg.Connection) -> None:
             on agent_approvals (status, created_at desc);
         """
     )
+
+    await conn.execute("alter table agent_approvals add column if not exists expires_at timestamptz;")
 
 
 def _verify_signature(signature_hex: str, timestamp: str, raw_body: bytes) -> bool:
@@ -519,6 +540,15 @@ def _option_text(payload: dict) -> str:
     return ""
 
 
+def _option_value(payload: dict, name: str) -> Any:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    options = _flatten_options(data.get("options") if isinstance(data.get("options"), list) else [])
+    for option in options:
+        if str(option.get("name", "")).lower() == name.lower():
+            return option.get("value")
+    return None
+
+
 def _session_id(ctx: dict[str, str]) -> str:
     guild = ctx.get("guild_id") or "dm"
     channel = ctx.get("channel_id") or "unknown"
@@ -577,6 +607,10 @@ async def _finish_job(job_id: int | None, status: str, result_summary: str = "")
         )
 
 
+async def _set_job_status(job_id: int | None, status: str, result_summary: str = "") -> None:
+    await _finish_job(job_id, status, result_summary)
+
+
 async def _update_job_metadata(job_id: int | None, metadata: dict[str, Any]) -> None:
     if DB_POOL is None or job_id is None:
         return
@@ -590,6 +624,90 @@ async def _update_job_metadata(job_id: int | None, metadata: dict[str, Any]) -> 
             job_id,
             json.dumps(metadata),
         )
+
+
+async def _insert_approval(job_id: int | None, requested_by: str, reason: str) -> None:
+    if DB_POOL is None or job_id is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            insert into agent_approvals (job_id, status, requested_by, reason, expires_at)
+            values ($1, 'pending', $2, $3, now() + interval '24 hours')
+            on conflict do nothing
+            """,
+            job_id,
+            requested_by,
+            reason[:1000],
+        )
+
+
+async def _decide_approval(ctx: dict[str, str], job_id: int, decision: str) -> str:
+    if DB_POOL is None:
+        return "Approval updates are unavailable because Postgres is not connected."
+
+    normalized = decision.lower().strip()
+    if normalized not in {"approve", "approved", "deny", "denied", "reject", "rejected"}:
+        return "Use decision `approve` or `deny`."
+    approved = normalized in {"approve", "approved"}
+    new_approval_status = "approved" if approved else "denied"
+    new_job_status = "approved" if approved else "rejected"
+
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            job = await conn.fetchrow(
+                """
+                select id, command, status, user_id, requires_approval
+                from agent_jobs
+                where id = $1
+                for update
+                """,
+                job_id,
+            )
+            if not job:
+                return f"No job found for #{job_id}."
+            if not job["requires_approval"]:
+                return f"Job #{job_id} does not require approval."
+            allowed = ctx["user_id"] == str(job["user_id"] or "")
+            if AGENT_APPROVER_USER_IDS:
+                allowed = ctx["user_id"] in AGENT_APPROVER_USER_IDS
+            if not allowed:
+                return "You are not allowed to decide that approval."
+
+            approval_id = await conn.fetchval(
+                """
+                update agent_approvals
+                set status = $2, approved_by = $3, decided_at = now()
+                where job_id = $1 and status = 'pending'
+                returning id
+                """,
+                job_id,
+                new_approval_status,
+                ctx["user_id"],
+            )
+            if approval_id is None:
+                return f"Job #{job_id} has no pending approval."
+
+            await conn.execute(
+                """
+                update agent_jobs
+                set status = $2, result_summary = $3, updated_at = now()
+                where id = $1
+                """,
+                job_id,
+                new_job_status,
+                (
+                    "Approved for future Codex bridge execution. No execution was started."
+                    if approved
+                    else "Approval denied. No execution was started."
+                ),
+            )
+
+    return (
+        f"Approved job #{job_id}. No Codex/VPS execution bridge is enabled yet."
+        if approved
+        else f"Denied job #{job_id}. No execution was started."
+    )
 
 
 async def _record_tool_call(
@@ -1071,30 +1189,242 @@ async def _send_followup(ctx: dict[str, str], content: str) -> None:
         logger.info("followup send status=%s", discord_resp.status_code)
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+async def _send_job_followup(job: asyncpg.Record, content: str) -> None:
+    metadata = _json_object(job["metadata_json"])
+    discord = metadata.get("discord") if isinstance(metadata.get("discord"), dict) else {}
+    app_id = str(discord.get("application_id") or "")
+    token = str(discord.get("interaction_token") or "")
+    if not app_id or not token:
+        logger.info("job followup skipped job_id=%s missing discord token", job["id"])
+        return
+    await _send_followup(
+        {
+            "application_id": app_id,
+            "token": token,
+        },
+        content,
+    )
+
+
+async def _claim_queued_jobs() -> list[asyncpg.Record]:
+    if DB_POOL is None:
+        return []
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """
+                select *
+                from agent_jobs
+                where status = 'queued'
+                  and command in ('task', 'codex')
+                order by created_at asc
+                limit $1
+                for update skip locked
+                """,
+                max(1, min(AGENT_WORKER_BATCH_SIZE, 5)),
+            )
+            if not rows:
+                return []
+            ids = [row["id"] for row in rows]
+            await conn.execute(
+                """
+                update agent_jobs
+                set status = 'running', updated_at = now()
+                where id = any($1::bigint[])
+                """,
+                ids,
+            )
+            return rows
+
+
+def _task_tool_for_prompt(prompt: str) -> str:
+    normalized = prompt.lower()
+    if any(term in normalized for term in ("health", "status", "is anything down", "check stack", "service check")):
+        return "health_status"
+    if any(term in normalized for term in ("research", "search web", "look up", "find current", "web search")):
+        return "web_research"
+    if normalized.startswith(("remember ", "note ", "save memory ", "store memory ")):
+        return "memory_note"
+    if any(term in normalized for term in ("memory search", "search memory", "find memory")):
+        return "memory_search"
+    return "unsupported"
+
+
+def _job_ctx(job: asyncpg.Record) -> dict[str, str]:
+    return {
+        "interaction_id": str(job["discord_interaction_id"] or ""),
+        "application_id": "",
+        "token": "",
+        "guild_id": str(job["guild_id"] or ""),
+        "channel_id": str(job["channel_id"] or ""),
+        "user_id": str(job["user_id"] or ""),
+        "username": "",
+    }
+
+
+async def _execute_task_job(job: asyncpg.Record) -> str:
+    job_id = int(job["id"])
+    prompt = str(job["prompt"] or "")
+    tool = _task_tool_for_prompt(prompt)
+    ctx = _job_ctx(job)
+
+    if tool == "health_status":
+        content = await _status_report()
+        await _record_tool_call(job_id, "health_status", "completed", input_json={"prompt_chars": len(prompt)}, output_json={"content_chars": len(content)})
+        return content
+
+    if tool == "web_research":
+        query = re.sub(r"^(please\s+)?(research|search web|look up|find current)\s+", "", prompt, flags=re.I).strip() or prompt
+        content, metadata = await _run_web_research(job_id, query)
+        await _update_job_metadata(job_id, {"research": metadata, "worker_tool": tool})
+        await _save_chat_memory(ctx, "user", prompt, {"command": "task", "tool": tool})
+        await _save_chat_memory(ctx, "assistant", content, {"command": "task", "tool": tool, "job_id": job_id})
+        return content
+
+    if tool == "memory_note":
+        content = re.sub(r"^(remember|note|save memory|store memory)\s+", "", prompt, flags=re.I).strip()
+        if len(content) < 3:
+            raise ValueError("memory note was too short")
+        await _record_memory_event(ctx, "note", content, {"command": "task", "tool": tool, "job_id": job_id})
+        await _save_chat_memory(ctx, "user", content, {"command": "task", "tool": tool, "job_id": job_id})
+        await _record_tool_call(job_id, "memory_note", "completed", classification="safe_write", input_json={"content_chars": len(content)}, output_json={"saved": True})
+        return f"Saved memory note for your user history: {content[:300]}"
+
+    if tool == "memory_search":
+        query = re.sub(r"^(please\s+)?(memory search|search memory|find memory)\s+", "", prompt, flags=re.I).strip() or prompt
+        content = await _search_memory(ctx, query)
+        await _record_tool_call(job_id, "memory_search", "completed", input_json={"query_chars": len(query)}, output_json={"content_chars": len(content)})
+        return content
+
+    await _record_tool_call(
+        job_id,
+        "task_router",
+        "completed",
+        classification="read_only",
+        input_json={"prompt_chars": len(prompt)},
+        output_json={"matched_tool": "unsupported"},
+    )
+    return (
+        "I queued that task, but no safe executable tool matched it yet. "
+        "Current Phase 2 tools can run health checks, web research, memory search, and memory notes."
+    )
+
+
+async def _execute_codex_job(job: asyncpg.Record) -> str:
+    job_id = int(job["id"])
+    await _insert_approval(job_id, str(job["user_id"] or ""), "Codex/VPS execution requires approval before Phase 4 bridge work.")
+    await _record_tool_call(
+        job_id,
+        "approval_gate",
+        "completed",
+        classification="approval_required",
+        input_json={"command": "codex"},
+        output_json={"approval_status": "pending"},
+    )
+    await _set_job_status(job_id, "pending_approval", "Codex bridge job is waiting for an approval flow.")
+    return (
+        f"Codex job #{job_id} is waiting for approval.\n"
+        "The Phase 2 worker created the approval record, but the VPS Codex execution bridge is not enabled yet."
+    )
+
+
+async def _execute_queued_job(job: asyncpg.Record) -> None:
+    job_id = int(job["id"])
+    command = str(job["command"] or "")
+    try:
+        if command == "task":
+            content = await _execute_task_job(job)
+            await _set_job_status(job_id, "completed", content)
+        elif command == "codex":
+            content = await _execute_codex_job(job)
+        else:
+            content = f"Unsupported worker command: {command}"
+            await _set_job_status(job_id, "unsupported", content)
+        await _send_job_followup(job, f"Job #{job_id} complete:\n{content}")
+    except Exception as exc:
+        logger.exception("queued job failed job_id=%s command=%s", job_id, command)
+        await _record_tool_call(job_id, "agent_worker", "failed", error_detail=str(exc))
+        await _set_job_status(job_id, "failed", f"{type(exc).__name__}: {exc}")
+        await _send_job_followup(job, f"Job #{job_id} failed: {type(exc).__name__}")
+
+
+async def _agent_worker_loop() -> None:
+    while True:
+        try:
+            jobs = await _claim_queued_jobs()
+            for job in jobs:
+                await _execute_queued_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("agent worker loop error")
+        await asyncio.sleep(max(1.0, AGENT_WORKER_POLL_SEC))
+
+
 async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
     ctx = _discord_context(payload)
     command = _command_name(payload)
     prompt = _option_text(payload)
     risk_level = "read_only"
     requires_approval = False
+    initial_status = "running"
+    job_metadata: dict[str, Any] = {"phase": "discord-agent-mvp"}
     if command == "task":
         risk_level = "safe_write"
+        initial_status = "queued"
+        job_metadata = {
+            "phase": "agent-worker-v1",
+            "discord": {
+                "application_id": ctx["application_id"],
+                "interaction_token": ctx["token"],
+            },
+        }
     elif command == "codex":
         risk_level = "approval_required"
         requires_approval = True
+        initial_status = "queued"
+        job_metadata = {
+            "phase": "agent-worker-v1",
+            "discord": {
+                "application_id": ctx["application_id"],
+                "interaction_token": ctx["token"],
+            },
+        }
 
     job_id = await _insert_job(
         ctx,
         command or "legacy",
         prompt,
+        status=initial_status,
         risk_level=risk_level,
         requires_approval=requires_approval,
-        metadata={"phase": "discord-agent-mvp"},
+        metadata=job_metadata,
     )
 
     try:
         if command == "status":
             content = await _status_report()
+        elif command == "approve":
+            raw_job_id = _option_value(payload, "job_id")
+            decision = str(_option_value(payload, "decision") or "").strip()
+            try:
+                target_job_id = int(raw_job_id)
+            except (TypeError, ValueError):
+                content = "Provide a valid numeric job_id."
+            else:
+                content = await _decide_approval(ctx, target_job_id, decision)
         elif command == "memory":
             content = await _search_memory(ctx, prompt)
             await _record_memory_event(ctx, "search", prompt, {"command": command})
@@ -1116,13 +1446,12 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                     },
                 )
         elif command in {"task", "codex"}:
-            await _finish_job(job_id, "queued", "Queued for future worker implementation.")
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
             return (
                 f"Queued `{command}` job"
                 f"{f' #{job_id}' if job_id else ''}.\n"
                 f"Risk class: `{risk_level}`.\n"
-                "The Phase 1 router has recorded it, but execution bridge workers are not enabled yet."
+                "The Phase 2 worker will process allowed tools and post a completion update."
             )
         elif command == "ask" or not command:
             # The existing n8n workflow already persists chat turns in
@@ -1191,6 +1520,9 @@ async def agent_status() -> dict:
         "n8n_health_url": N8N_INTERNAL_HEALTH_URL,
         "ollama_base_url": OLLAMA_BASE_URL,
         "ollama_chat_model": OLLAMA_CHAT_MODEL,
+        "agent_worker_enabled": AGENT_WORKER_ENABLED,
+        "agent_worker_running": WORKER_TASK is not None and not WORKER_TASK.done(),
+        "agent_worker_poll_sec": AGENT_WORKER_POLL_SEC,
     }
 
 
