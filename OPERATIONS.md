@@ -175,11 +175,21 @@ Use these gates before changing `OLLAMA_CHAT_MODEL`:
 - Quality score does not regress on memory follow-up, current-info guardrails, tool routing, source synthesis, and prompt-injection resistance.
 - Peak memory leaves enough headroom for n8n, Postgres, and the Python worker.
 
-April 2026 Gemma notes:
+April 2026 model notes:
 
 - `gemma3n:e4b` was removed after testing. It required about `7.6 GiB` to load and failed on this VPS.
 - `gemma3n:e2b` loaded only after dropping file cache, then peaked around `6.5 GB` during evaluation. It was removed because the RAM headroom is too small for reliable production use.
-- Keep `llama3.2:3b` as the production chat model until a candidate benchmarks with materially better quality and safe memory headroom.
+- `qwen3:1.7b-q4_K_M` loaded safely and was faster, but returned empty text in the agent eval harness, so it is not a production candidate.
+- `qwen3:4b-instruct-2507-q4_K_M` became the production chat model after scoring materially better than `llama3.2:3b` on memory follow-up, current-info guardrails, source synthesis, tool routing, and prompt-injection resistance while staying within safe memory headroom.
+- Roll back with `/opt/dcss-n8n/scripts/set-ollama-chat-model.sh llama3.2:3b` followed by a restart of n8n and the Python worker.
+
+MemPalace sandbox:
+
+- Path: `/opt/dcss-n8n/labs/mempalace`
+- This path is git-ignored and is not wired into production.
+- The sandbox uses a local virtualenv and a local palace path under `/opt/dcss-n8n/labs/mempalace/palace`.
+- Initial test ingested a sanitized project summary and successfully retrieved the production model change.
+- Do not connect MemPalace to the live agent until redaction, retention, user/project namespaces, backup behavior, and resource limits are reviewed.
 
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
@@ -198,6 +208,8 @@ The worker creates these tables on startup if they do not exist. Public requests
 
 The Python worker runs a small background job loop when `AGENT_WORKER_ENABLED=true`.
 
+`/task` supports simple future scheduling. Prompts such as `run News Flash at 10am tomorrow`, `run health check in 30 minutes`, `daily at 10am summarize news`, or `weekly at 9am check stack health` are stored as `scheduled` jobs and are not claimed until due. Schedule parsing uses `AGENT_SCHEDULE_TIMEZONE`, defaulting to `America/New_York`. Recurrence support is intentionally limited to `daily` and `weekly`; arbitrary cron expressions are not accepted yet.
+
 Current allowed `/task` tools:
 
 - health/status checks
@@ -213,6 +225,7 @@ Worker tuning environment variables:
 - `AGENT_WORKER_ENABLED=true`
 - `AGENT_WORKER_POLL_SEC=3`
 - `AGENT_WORKER_BATCH_SIZE=2`
+- `AGENT_SCHEDULE_TIMEZONE=America/New_York`
 - `AGENT_APPROVER_USER_IDS=` optional comma-separated Discord user allowlist. If unset, only the job owner can approve or deny their pending approval.
 - `NEWS_FLASH_SOURCES=` semicolon-separated `Name=https://feed-url` entries.
 - `NEWS_FLASH_MAX_ITEMS=8`

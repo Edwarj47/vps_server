@@ -7,11 +7,12 @@ import socket
 import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
 
 import asyncpg
@@ -45,6 +46,7 @@ OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 AGENT_WORKER_ENABLED = os.getenv("AGENT_WORKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 AGENT_WORKER_POLL_SEC = float(os.getenv("AGENT_WORKER_POLL_SEC", "3"))
 AGENT_WORKER_BATCH_SIZE = int(os.getenv("AGENT_WORKER_BATCH_SIZE", "2"))
+AGENT_SCHEDULE_TIMEZONE = os.getenv("AGENT_SCHEDULE_TIMEZONE", "America/New_York")
 AGENT_APPROVER_USER_IDS = {
     user_id.strip()
     for user_id in os.getenv("AGENT_APPROVER_USER_IDS", "").split(",")
@@ -230,6 +232,17 @@ async def _ensure_agent_tables(conn: asyncpg.Connection) -> None:
         """
     )
 
+    await conn.execute("alter table agent_jobs add column if not exists scheduled_at timestamptz;")
+    await conn.execute("alter table agent_jobs add column if not exists schedule_label text;")
+    await conn.execute("alter table agent_jobs add column if not exists recurrence_rule text;")
+    await conn.execute("alter table agent_jobs add column if not exists last_run_at timestamptz;")
+    await conn.execute(
+        """
+        create index if not exists idx_agent_jobs_scheduled_due
+            on agent_jobs (status, scheduled_at asc)
+            where status = 'scheduled'
+        """
+    )
     await conn.execute("alter table agent_approvals add column if not exists expires_at timestamptz;")
 
 
@@ -837,6 +850,97 @@ def _session_id(ctx: dict[str, str]) -> str:
     return f"discord:{guild}:{channel}:{user}"
 
 
+def _schedule_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(AGENT_SCHEDULE_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        logger.warning("invalid AGENT_SCHEDULE_TIMEZONE=%s; falling back to UTC", AGENT_SCHEDULE_TIMEZONE)
+        return ZoneInfo("UTC")
+
+
+def _parse_time_fragment(text: str) -> tuple[int, int] | None:
+    match = re.search(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text, flags=re.I)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    suffix = (match.group(3) or "").lower()
+    if minute > 59:
+        return None
+    if suffix:
+        if hour < 1 or hour > 12:
+            return None
+        if suffix == "pm" and hour != 12:
+            hour += 12
+        if suffix == "am" and hour == 12:
+            hour = 0
+    elif hour > 23:
+        return None
+    return hour, minute
+
+
+def _parse_task_schedule(prompt: str) -> dict[str, Any] | None:
+    normalized = " ".join(prompt.lower().split())
+    tz = _schedule_timezone()
+    now_local = datetime.now(tz)
+    recurrence_rule = ""
+
+    if re.search(r"\b(every day|daily)\b", normalized):
+        recurrence_rule = "daily"
+    elif re.search(r"\b(every week|weekly)\b", normalized):
+        recurrence_rule = "weekly"
+
+    relative = re.search(r"\bin\s+(\d{1,3})\s*(minute|minutes|hour|hours|day|days)\b", normalized)
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2)
+        if unit.startswith("minute"):
+            scheduled_local = now_local + timedelta(minutes=amount)
+        elif unit.startswith("hour"):
+            scheduled_local = now_local + timedelta(hours=amount)
+        else:
+            scheduled_local = now_local + timedelta(days=amount)
+        return {
+            "scheduled_at": scheduled_local.astimezone(timezone.utc),
+            "schedule_label": scheduled_local.strftime(f"%Y-%m-%d %H:%M {tz.key}"),
+            "recurrence_rule": recurrence_rule,
+        }
+
+    time_fragment = _parse_time_fragment(normalized)
+    has_schedule_word = any(
+        term in normalized
+        for term in ("tomorrow", "tonight", "today", "at ", "daily", "every day", "weekly", "every week")
+    )
+    if not time_fragment or not has_schedule_word:
+        return None
+
+    day_offset = 0
+    if "tomorrow" in normalized:
+        day_offset = 1
+    scheduled_local = now_local.replace(
+        hour=time_fragment[0],
+        minute=time_fragment[1],
+        second=0,
+        microsecond=0,
+    ) + timedelta(days=day_offset)
+    if scheduled_local <= now_local:
+        scheduled_local += timedelta(days=1)
+
+    return {
+        "scheduled_at": scheduled_local.astimezone(timezone.utc),
+        "schedule_label": scheduled_local.strftime(f"%Y-%m-%d %H:%M {tz.key}"),
+        "recurrence_rule": recurrence_rule,
+    }
+
+
+def _next_recurring_schedule(current: datetime, recurrence_rule: str) -> datetime | None:
+    if recurrence_rule == "daily":
+        return current + timedelta(days=1)
+    if recurrence_rule == "weekly":
+        return current + timedelta(days=7)
+    return None
+
+
 async def _insert_job(
     ctx: dict[str, str],
     command: str,
@@ -846,6 +950,9 @@ async def _insert_job(
     risk_level: str = "read_only",
     requires_approval: bool = False,
     metadata: dict | None = None,
+    scheduled_at: datetime | None = None,
+    schedule_label: str = "",
+    recurrence_rule: str = "",
 ) -> int | None:
     if DB_POOL is None:
         return None
@@ -854,9 +961,10 @@ async def _insert_job(
             """
             insert into agent_jobs (
                 discord_interaction_id, guild_id, channel_id, user_id,
-                command, prompt, status, risk_level, requires_approval, metadata_json
+                command, prompt, status, risk_level, requires_approval, metadata_json,
+                scheduled_at, schedule_label, recurrence_rule
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13)
             returning id
             """,
             ctx["interaction_id"],
@@ -869,6 +977,9 @@ async def _insert_job(
             risk_level,
             requires_approval,
             json.dumps(metadata or {}),
+            scheduled_at,
+            schedule_label[:200],
+            recurrence_rule[:80],
         )
 
 
@@ -1508,9 +1619,12 @@ async def _claim_queued_jobs() -> list[asyncpg.Record]:
                 """
                 select *
                 from agent_jobs
-                where status = 'queued'
-                  and command in ('task', 'codex')
-                order by created_at asc
+                where command in ('task', 'codex')
+                  and (
+                    status = 'queued'
+                    or (status = 'scheduled' and scheduled_at <= now())
+                  )
+                order by coalesce(scheduled_at, created_at) asc
                 limit $1
                 for update skip locked
                 """,
@@ -1522,7 +1636,7 @@ async def _claim_queued_jobs() -> list[asyncpg.Record]:
             await conn.execute(
                 """
                 update agent_jobs
-                set status = 'running', updated_at = now()
+                set status = 'running', last_run_at = now(), updated_at = now()
                 where id = any($1::bigint[])
                 """,
                 ids,
@@ -1646,6 +1760,37 @@ async def _execute_codex_job(job: asyncpg.Record) -> str:
     )
 
 
+async def _reschedule_recurring_job(job: asyncpg.Record) -> bool:
+    if DB_POOL is None:
+        return False
+    recurrence_rule = str(job["recurrence_rule"] or "").strip().lower()
+    scheduled_at = job["scheduled_at"]
+    if not recurrence_rule or scheduled_at is None:
+        return False
+    next_scheduled_at = _next_recurring_schedule(scheduled_at, recurrence_rule)
+    if next_scheduled_at is None:
+        return False
+    tz = _schedule_timezone()
+    schedule_label = next_scheduled_at.astimezone(tz).strftime(f"%Y-%m-%d %H:%M {tz.key}")
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            update agent_jobs
+            set status = 'scheduled',
+                scheduled_at = $2,
+                schedule_label = $3,
+                result_summary = $4,
+                updated_at = now()
+            where id = $1
+            """,
+            int(job["id"]),
+            next_scheduled_at,
+            schedule_label,
+            f"Recurring job rescheduled for {schedule_label}.",
+        )
+    return True
+
+
 async def _execute_queued_job(job: asyncpg.Record) -> None:
     job_id = int(job["id"])
     command = str(job["command"] or "")
@@ -1659,6 +1804,8 @@ async def _execute_queued_job(job: asyncpg.Record) -> None:
             content = f"Unsupported worker command: {command}"
             await _set_job_status(job_id, "unsupported", content)
         await _send_job_followup(job, f"Job #{job_id} complete:\n{content}")
+        if command == "task" and await _reschedule_recurring_job(job):
+            await _send_job_followup(job, f"Job #{job_id} has been rescheduled for the next `{job['recurrence_rule']}` run.")
     except Exception as exc:
         logger.exception("queued job failed job_id=%s command=%s", job_id, command)
         await _record_tool_call(job_id, "agent_worker", "failed", error_detail=str(exc))
@@ -1687,9 +1834,13 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
     requires_approval = False
     initial_status = "running"
     job_metadata: dict[str, Any] = {"phase": "discord-agent-mvp"}
+    schedule: dict[str, Any] | None = None
     if command == "task":
         risk_level = "safe_write"
         initial_status = "queued"
+        schedule = _parse_task_schedule(prompt)
+        if schedule:
+            initial_status = "scheduled"
         job_metadata = {
             "phase": "agent-worker-v1",
             "discord": {
@@ -1697,6 +1848,11 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                 "interaction_token": ctx["token"],
             },
         }
+        if schedule:
+            job_metadata["schedule"] = {
+                "label": schedule["schedule_label"],
+                "recurrence_rule": schedule["recurrence_rule"],
+            }
     elif command == "codex":
         risk_level = "approval_required"
         requires_approval = True
@@ -1717,6 +1873,9 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
         risk_level=risk_level,
         requires_approval=requires_approval,
         metadata=job_metadata,
+        scheduled_at=schedule["scheduled_at"] if schedule else None,
+        schedule_label=schedule["schedule_label"] if schedule else "",
+        recurrence_rule=schedule["recurrence_rule"] if schedule else "",
     )
 
     try:
@@ -1767,6 +1926,14 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                 )
         elif command in {"task", "codex"}:
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
+            if command == "task" and schedule:
+                repeat = f"\nRepeat: `{schedule['recurrence_rule']}`." if schedule["recurrence_rule"] else ""
+                return (
+                    f"Scheduled `task` job"
+                    f"{f' #{job_id}' if job_id else ''} for `{schedule['schedule_label']}`.{repeat}\n"
+                    f"Risk class: `{risk_level}`.\n"
+                    "The Phase 2 worker will process it when due and post a completion update."
+                )
             return (
                 f"Queued `{command}` job"
                 f"{f' #{job_id}' if job_id else ''}.\n"

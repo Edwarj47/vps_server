@@ -34,7 +34,15 @@ fi
 
 tmp="$(mktemp)"
 sudo jq --arg model "$MODEL" \
-  '.[0].nodes |= map(if .name == "Ollama Chat Model" then (.parameters.model = $model) else . end)' \
+  '.[0].nodes |= map(
+    if .name == "Ollama Chat Model" then
+      (.parameters.model = $model)
+    elif .name == "Build Chat Response" then
+      (.parameters.jsCode |= sub("const modelUsed = String\\([^;]+\\);"; "const modelUsed = String(" + ($model|@json) + ");"))
+    else
+      .
+    end
+  )' \
   "$WORKFLOW_EXPORT" > "$tmp"
 sudo install -o root -g root -m 0644 "$tmp" "$WORKFLOW_EXPORT"
 rm -f "$tmp"
