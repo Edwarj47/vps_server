@@ -132,6 +132,7 @@ Supported slash-command names in the Phase 1 router:
 - `/task`: records a queued job in `agent_jobs`; the Phase 2 worker executes allowed internal tools and posts a Discord completion update.
 - `/codex`: records an approval-oriented queued job in `agent_jobs`; the Phase 2 worker creates a pending approval record, but the Codex bridge is not enabled yet.
 - `/approve`: marks a pending approval as approved or denied. Approval does not execute Codex/VPS work until the Codex bridge exists.
+- `/schedule`: manages future `/task` jobs with `list`, `cancel`, and `reschedule` subcommands.
 
 The Discord app needs matching slash commands registered with Discord before users can invoke these names from the client. Unknown commands and legacy interactions continue to fall back to the existing n8n webhook path.
 
@@ -209,6 +210,8 @@ The worker creates these tables on startup if they do not exist. Public requests
 The Python worker runs a small background job loop when `AGENT_WORKER_ENABLED=true`.
 
 `/task` supports simple future scheduling. Prompts such as `run News Flash at 10am tomorrow`, `run health check in 30 minutes`, `daily at 10am summarize news`, or `weekly at 9am check stack health` are stored as `scheduled` jobs and are not claimed until due. Schedule parsing uses `AGENT_SCHEDULE_TIMEZONE`, defaulting to `America/New_York`. Recurrence support is intentionally limited to `daily` and `weekly`; arbitrary cron expressions are not accepted yet.
+
+Use `/schedule list` to view scheduled jobs, `/schedule cancel job_id:<id>` to cancel a scheduled job, and `/schedule reschedule job_id:<id> when:<time>` to move a queued or scheduled job. Users can manage their own scheduled jobs. If `AGENT_APPROVER_USER_IDS` is configured, approvers can list and manage all scheduled jobs.
 
 Current allowed `/task` tools:
 

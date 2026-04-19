@@ -115,6 +115,50 @@ curl -fsS \
         ]
       }
     ]
+  },
+  {
+    "name": "schedule",
+    "description": "Manage scheduled agent tasks",
+    "type": 1,
+    "options": [
+      {
+        "name": "list",
+        "description": "List scheduled jobs",
+        "type": 1
+      },
+      {
+        "name": "cancel",
+        "description": "Cancel a scheduled job",
+        "type": 1,
+        "options": [
+          {
+            "name": "job_id",
+            "description": "Scheduled job number",
+            "type": 4,
+            "required": true
+          }
+        ]
+      },
+      {
+        "name": "reschedule",
+        "description": "Move a scheduled job to a new time",
+        "type": 1,
+        "options": [
+          {
+            "name": "job_id",
+            "description": "Scheduled job number",
+            "type": 4,
+            "required": true
+          },
+          {
+            "name": "when",
+            "description": "Example: 10am tomorrow, in 30 minutes, daily at 10am",
+            "type": 3,
+            "required": true
+          }
+        ]
+      }
+    ]
   }
 ]
 JSON

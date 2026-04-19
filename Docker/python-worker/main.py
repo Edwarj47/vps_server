@@ -811,6 +811,15 @@ def _command_name(payload: dict) -> str:
     return str(data.get("name") or "").lower()
 
 
+def _subcommand_name(payload: dict) -> str:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    options = data.get("options") if isinstance(data.get("options"), list) else []
+    for option in options:
+        if int(option.get("type") or 0) == 1:
+            return str(option.get("name") or "").lower()
+    return ""
+
+
 def _flatten_options(options: list[dict] | None) -> list[dict]:
     flat: list[dict] = []
     for option in options or []:
@@ -1100,6 +1109,150 @@ async def _decide_approval(ctx: dict[str, str], job_id: int, decision: str) -> s
         if approved
         else f"Denied job #{job_id}. No execution was started."
     )
+
+
+def _can_manage_job(ctx: dict[str, str], job_user_id: str) -> bool:
+    if AGENT_APPROVER_USER_IDS:
+        return ctx["user_id"] in AGENT_APPROVER_USER_IDS
+    return ctx["user_id"] == job_user_id
+
+
+async def _list_scheduled_jobs(ctx: dict[str, str]) -> str:
+    if DB_POOL is None:
+        return "Schedule management is unavailable because Postgres is not connected."
+    async with DB_POOL.acquire() as conn:
+        if AGENT_APPROVER_USER_IDS and ctx["user_id"] in AGENT_APPROVER_USER_IDS:
+            rows = await conn.fetch(
+                """
+                select id, command, prompt, status, schedule_label, recurrence_rule, user_id
+                from agent_jobs
+                where status = 'scheduled'
+                order by scheduled_at asc
+                limit 10
+                """
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                select id, command, prompt, status, schedule_label, recurrence_rule, user_id
+                from agent_jobs
+                where status = 'scheduled' and user_id = $1
+                order by scheduled_at asc
+                limit 10
+                """,
+                ctx["user_id"],
+            )
+
+    if not rows:
+        return "No scheduled jobs found."
+
+    lines = ["Scheduled jobs:"]
+    for row in rows:
+        repeat = f", repeats {row['recurrence_rule']}" if row["recurrence_rule"] else ""
+        owner = f", user {row['user_id']}" if AGENT_APPROVER_USER_IDS and ctx["user_id"] in AGENT_APPROVER_USER_IDS else ""
+        prompt = " ".join(str(row["prompt"] or "").split())[:120]
+        lines.append(f"- #{row['id']} at {row['schedule_label']}{repeat}{owner}: {prompt}")
+    return "\n".join(lines)[:1900]
+
+
+async def _cancel_scheduled_job(ctx: dict[str, str], job_id: int) -> str:
+    if DB_POOL is None:
+        return "Schedule management is unavailable because Postgres is not connected."
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            job = await conn.fetchrow(
+                """
+                select id, status, user_id, prompt
+                from agent_jobs
+                where id = $1
+                for update
+                """,
+                job_id,
+            )
+            if not job:
+                return f"No job found for #{job_id}."
+            if not _can_manage_job(ctx, str(job["user_id"] or "")):
+                return "You are not allowed to manage that scheduled job."
+            if job["status"] != "scheduled":
+                return f"Job #{job_id} is `{job['status']}`, not `scheduled`."
+            await conn.execute(
+                """
+                update agent_jobs
+                set status = 'cancelled',
+                    result_summary = 'Cancelled by schedule command.',
+                    updated_at = now()
+                where id = $1
+                """,
+                job_id,
+            )
+    return f"Cancelled scheduled job #{job_id}."
+
+
+async def _reschedule_job(ctx: dict[str, str], job_id: int, when_text: str) -> str:
+    if DB_POOL is None:
+        return "Schedule management is unavailable because Postgres is not connected."
+    schedule = _parse_task_schedule(when_text)
+    if not schedule:
+        return "I could not parse that schedule. Try `10am tomorrow`, `in 30 minutes`, `daily at 10am`, or `weekly at 9am`."
+
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            job = await conn.fetchrow(
+                """
+                select id, status, user_id
+                from agent_jobs
+                where id = $1
+                for update
+                """,
+                job_id,
+            )
+            if not job:
+                return f"No job found for #{job_id}."
+            if not _can_manage_job(ctx, str(job["user_id"] or "")):
+                return "You are not allowed to manage that scheduled job."
+            if job["status"] not in {"scheduled", "queued"}:
+                return f"Job #{job_id} is `{job['status']}` and cannot be rescheduled."
+            await conn.execute(
+                """
+                update agent_jobs
+                set status = 'scheduled',
+                    scheduled_at = $2,
+                    schedule_label = $3,
+                    recurrence_rule = $4,
+                    result_summary = $5,
+                    updated_at = now()
+                where id = $1
+                """,
+                job_id,
+                schedule["scheduled_at"],
+                schedule["schedule_label"],
+                schedule["recurrence_rule"],
+                f"Rescheduled for {schedule['schedule_label']}.",
+            )
+    repeat = f" Repeat: `{schedule['recurrence_rule']}`." if schedule["recurrence_rule"] else ""
+    return f"Rescheduled job #{job_id} for `{schedule['schedule_label']}`.{repeat}"
+
+
+async def _handle_schedule_command(ctx: dict[str, str], payload: dict) -> str:
+    subcommand = _subcommand_name(payload)
+    if subcommand == "list":
+        return await _list_scheduled_jobs(ctx)
+    if subcommand == "cancel":
+        raw_job_id = _option_value(payload, "job_id")
+        try:
+            job_id = int(raw_job_id)
+        except (TypeError, ValueError):
+            return "Provide a valid numeric job_id."
+        return await _cancel_scheduled_job(ctx, job_id)
+    if subcommand in {"reschedule", "update"}:
+        raw_job_id = _option_value(payload, "job_id")
+        when_text = str(_option_value(payload, "when") or "").strip()
+        try:
+            job_id = int(raw_job_id)
+        except (TypeError, ValueError):
+            return "Provide a valid numeric job_id."
+        return await _reschedule_job(ctx, job_id, when_text)
+    return "Use `/schedule list`, `/schedule cancel`, or `/schedule reschedule`."
 
 
 async def _record_tool_call(
@@ -1904,6 +2057,8 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                 content = "Provide a valid numeric job_id."
             else:
                 content = await _decide_approval(ctx, target_job_id, decision)
+        elif command == "schedule":
+            content = await _handle_schedule_command(ctx, payload)
         elif command == "memory":
             content = await _search_memory(ctx, prompt)
             await _record_memory_event(ctx, "search", prompt, {"command": command})
