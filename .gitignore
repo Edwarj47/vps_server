@@ -3,6 +3,7 @@
 *.bak.*
 *.codex-pre-*
 backups/
+model-evals/
 Docker/python-worker/__pycache__/
 Docker/python-worker/*.pyc
 Docker/python-worker/.pytest_cache/

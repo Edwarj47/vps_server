@@ -91,6 +91,21 @@ Smoke-test an installed Ollama model without touching n8n:
 /opt/dcss-n8n/scripts/ollama-model-smoke-test.sh llama3.2:3b "Say hello in one short sentence."
 ```
 
+Benchmark installed Ollama models before switching production chat:
+
+```bash
+/opt/dcss-n8n/scripts/eval-ollama-models.py llama3.2:3b gemma3n:e4b --num-predict 120 --timeout 180
+```
+
+The evaluator resolves the private Docker-only Ollama endpoint automatically. It records latency, p95 latency, generated tokens per second, prompt/eval token counts, peak Ollama container memory, installed model size, pass/fail for agent-specific prompt cases, and the full responses for review. Reports are written locally under `/opt/dcss-n8n/model-evals/` and are intentionally not git-tracked.
+
+Use these gates before changing `OLLAMA_CHAT_MODEL`:
+
+- Model loads successfully on the VPS without memory errors.
+- Average latency is acceptable for Discord.
+- Quality score does not regress on memory follow-up, current-info guardrails, tool routing, source synthesis, and prompt-injection resistance.
+- Peak memory leaves enough headroom for n8n, Postgres, and the Python worker.
+
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
 The n8n workflow validates `x-n8n-shared-secret` from the `N8N_WEBHOOK_SHARED_SECRET` environment variable. Do not hardcode this value in workflow JSON or scripts. Rotate it after any suspected exposure, then recreate both `n8n` and `python-worker`.
