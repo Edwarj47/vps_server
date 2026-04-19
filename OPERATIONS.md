@@ -114,6 +114,14 @@ journalctl -u dcss-n8n-health.service -n 50 --no-pager
 
 The Discord gateway lives in `/opt/dcss-n8n/Docker/python-worker`.
 
+Authority model:
+
+- Ollama may answer, summarize, search supplied memory, and recommend allowed `/task` or `/research` paths.
+- Ollama must not create, request, or imply Codex/VPS execution.
+- `/task` must not route shell, SSH, sudo, Docker, service restart, file-edit, or Codex-like requests.
+- Codex work can only enter the queue through the explicit Discord `/codex` command.
+- Approval is a human/Discord decision gate. Codex is an executor after approval, not the approver.
+
 Supported slash-command names in the Phase 1 router:
 
 - `/status`: read-only health report for n8n, Ollama, and Postgres.

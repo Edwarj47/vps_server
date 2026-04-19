@@ -72,6 +72,8 @@ except ValueError as exc:
 DB_POOL: asyncpg.Pool | None = None
 WORKER_TASK: asyncio.Task | None = None
 
+CODEX_ROUTE_POLICY = "Only the explicit Discord /codex command may create Codex jobs."
+
 
 PRIVATE_HOSTS = {"localhost", "0.0.0.0"}
 PRIVATE_NET_PREFIXES = (
@@ -1251,6 +1253,8 @@ async def _claim_queued_jobs() -> list[asyncpg.Record]:
 
 def _task_tool_for_prompt(prompt: str) -> str:
     normalized = prompt.lower()
+    if re.search(r"\b(codex|ssh|terminal|shell|sudo|docker exec|systemctl|modify files?|edit files?)\b", normalized):
+        return "blocked_codex_or_ops"
     if any(term in normalized for term in ("health", "status", "is anything down", "check stack", "service check")):
         return "health_status"
     if any(term in normalized for term in ("research", "search web", "look up", "find current", "web search")):
@@ -1307,6 +1311,20 @@ async def _execute_task_job(job: asyncpg.Record) -> str:
         content = await _search_memory(ctx, query)
         await _record_tool_call(job_id, "memory_search", "completed", input_json={"query_chars": len(query)}, output_json={"content_chars": len(content)})
         return content
+
+    if tool == "blocked_codex_or_ops":
+        await _record_tool_call(
+            job_id,
+            "authority_policy",
+            "completed",
+            classification="approval_required",
+            input_json={"prompt_chars": len(prompt)},
+            output_json={"policy": CODEX_ROUTE_POLICY},
+        )
+        return (
+            "That request looks like Codex/VPS execution work. "
+            "For safety, I will not route it from `/task` or Ollama. Use `/codex` explicitly."
+        )
 
     await _record_tool_call(
         job_id,
