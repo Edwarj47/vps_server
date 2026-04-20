@@ -140,11 +140,15 @@ The Discord app needs matching slash commands registered with Discord before use
 
 - The Python router retrieves the last 5 unique prior messages for the Discord session.
 - It also retrieves up to 3 simple text matches from the caller's memory history.
+- When `ASK_MEMPALACE_ENABLED=true`, the router can attach read-only `project_ops/project_facts` MemPalace context for project/tool/model/schedule/status questions.
+- User-history MemPalace context is disabled by default with `ASK_MEMPALACE_USER_ENABLED=false`.
 - The router sends this as `agent_context` to the n8n Ollama workflow.
 - The n8n workflow builds `promptForModel` and the AI Agent uses that instead of the raw prompt.
 - The router records `/ask` timing under `agent_jobs.metadata_json.timing` and writes a `n8n_ollama_chat` row to `agent_tool_calls`.
 
 The current memory retrieval is intentionally small and simple to control latency. It is not yet semantic/vector memory.
+
+MemPalace project facts are intentionally attached only for likely project questions. This keeps normal `/ask` prompts from being polluted by operational context while letting the agent answer stack questions without forcing the user to juggle `/memory`.
 
 The chat model is configured with `OLLAMA_CHAT_MODEL` in `/opt/dcss-n8n/Docker/.env`. Use the sync script below so the `.env`, tracked workflow export, and active n8n workflow records all agree:
 
@@ -204,11 +208,12 @@ Read-only MemPalace trial:
 - Eval tool: `scripts/eval-memory-retrieval.py`
 - Discord test plan: `MEMORY_TEST_PLAN.md`
 - Trial palace: `/opt/dcss-n8n/labs/mempalace/palace-readonly-trial`
-- Latest sanitized Discord import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_142429`
-- Latest project docs import: `/opt/dcss-n8n/labs/mempalace/imports/project-docs-20260420_142437`
+- Latest sanitized Discord import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_145808`
+- Latest project docs import: `/opt/dcss-n8n/labs/mempalace/imports/project-docs-20260420_145817`
 - Latest eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_142550.md`
 - The wrapper exposes only `status`, `namespaces`, and `search`. It contains no write, delete, hook, or mutation path.
 - Discord can query the wrapper explicitly through `/memory source:mempalace` or `/memory source:project`; `/ask` does not use MemPalace automatically.
+- `/ask` may use the project facts when `ASK_MEMPALACE_ENABLED=true`; it does not use MemPalace user-history memory unless explicitly enabled later.
 - `PROJECT_MEMORY.md` holds curated non-secret project facts. The project-docs import splits those facts into the `project_facts` room so Discord gets concise project answers instead of raw manual fragments.
 - Secret-oriented memory searches return a fixed refusal/reminder instead of searching or replaying memory content.
 - Discord snowflake IDs and session identifiers are redacted during sanitized imports, and the Discord-facing memory formatter redacts any remaining identifier-shaped text before display.
@@ -232,6 +237,9 @@ Phase 1 persistence tables:
 - `agent_jobs`
 - `agent_tool_calls`
 - `agent_memory_events`
+- `agent_tool_registry`
+
+`agent_tool_registry` is the foundation for future user-added tools. Tool rows are scoped by `guild_id`; they can hold non-secret configuration and a `credential_ref`, but not raw tokens or credentials. This keeps tools, memory, and credentials from one Discord server from becoming available in another server if the bot is added elsewhere.
 - `agent_approvals`
 
 The worker creates these tables on startup if they do not exist. Public requests to `/discord/interactions` still require Discord Ed25519 signature verification.
@@ -276,6 +284,11 @@ Worker tuning environment variables:
 - `CODEX_ALLOWED_WORKDIRS=/opt/dcss-n8n,/home/codexvps/Desktop`
 - `MEMPALACE_READONLY_ENABLED=true`
 - `MEMPALACE_SEARCH_TIMEOUT_SEC=5`
+- `ASK_MEMPALACE_ENABLED=true`
+- `ASK_MEMPALACE_PROJECT_ENABLED=true`
+- `ASK_MEMPALACE_USER_ENABLED=false`
+- `ASK_MEMPALACE_TIMEOUT_SEC=8`
+- `ASK_MEMPALACE_MAX_CONTEXT_CHARS=1200`
 - `NEWS_FLASH_SOURCES=` semicolon-separated `Name=https://feed-url` entries.
 - `NEWS_FLASH_MAX_ITEMS=8`
 - `NEWS_FLASH_TIMEOUT_SEC=8`

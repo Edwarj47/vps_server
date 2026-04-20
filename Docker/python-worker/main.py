@@ -83,6 +83,11 @@ MEMPALACE_READONLY_ENABLED = os.getenv("MEMPALACE_READONLY_ENABLED", "true").str
 MEMPALACE_PYTHON = os.getenv("MEMPALACE_PYTHON", "/usr/local/bin/python")
 MEMPALACE_READONLY_SCRIPT = os.getenv("MEMPALACE_READONLY_SCRIPT", "/opt/dcss-n8n/scripts/mempalace-readonly.py")
 MEMPALACE_SEARCH_TIMEOUT_SEC = float(os.getenv("MEMPALACE_SEARCH_TIMEOUT_SEC", "5"))
+ASK_MEMPALACE_ENABLED = os.getenv("ASK_MEMPALACE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+ASK_MEMPALACE_PROJECT_ENABLED = os.getenv("ASK_MEMPALACE_PROJECT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+ASK_MEMPALACE_USER_ENABLED = os.getenv("ASK_MEMPALACE_USER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+ASK_MEMPALACE_TIMEOUT_SEC = float(os.getenv("ASK_MEMPALACE_TIMEOUT_SEC", "8"))
+ASK_MEMPALACE_MAX_CONTEXT_CHARS = int(os.getenv("ASK_MEMPALACE_MAX_CONTEXT_CHARS", "1200"))
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -240,6 +245,24 @@ async def _ensure_agent_tables(conn: asyncpg.Connection) -> None:
 
         create index if not exists idx_agent_approvals_status_created
             on agent_approvals (status, created_at desc);
+
+        create table if not exists agent_tool_registry (
+            id bigserial primary key,
+            guild_id text not null,
+            owner_user_id text,
+            name text not null,
+            description text not null default '',
+            classification text not null default 'read_only',
+            status text not null default 'disabled',
+            credential_ref text,
+            config_json jsonb not null default '{}'::jsonb,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            unique (guild_id, name)
+        );
+
+        create index if not exists idx_agent_tool_registry_guild_status
+            on agent_tool_registry (guild_id, status, name);
         """
     )
 
@@ -1475,46 +1498,15 @@ async def _search_mempalace_memory(query: str, source: str = "mempalace") -> str
         )
 
     wing = "project_ops" if source == "project" else None
-    cmd = [
-        MEMPALACE_PYTHON,
-        MEMPALACE_READONLY_SCRIPT,
-        "search",
-        query[:500],
-        "--results",
-        "6",
-    ]
-    if wing:
-        cmd.extend(["--wing", wing])
-
-    proc = None
     try:
-        env = os.environ.copy()
-        env["HOME"] = "/tmp"
-        env["XDG_CACHE_HOME"] = "/tmp"
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MEMPALACE_SEARCH_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        if proc is not None:
-            with suppress(Exception):
-                proc.kill()
+        payload, _elapsed_ms = await _run_mempalace_search(query, wing=wing, results=6, timeout_sec=MEMPALACE_SEARCH_TIMEOUT_SEC)
+    except TimeoutError:
         return "MemPalace search timed out."
+    except RuntimeError as exc:
+        return str(exc)
     except Exception as exc:
         logger.exception("mempalace search failed")
         return f"MemPalace search failed: {type(exc).__name__}"
-
-    if proc.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()[:300]
-        return f"MemPalace search failed.{f' Detail: {detail}' if detail else ''}"
-
-    try:
-        payload = json.loads(stdout.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return "MemPalace search returned an unreadable response."
 
     hits = payload.get("results") or []
     if not hits:
@@ -1555,6 +1547,51 @@ async def _search_mempalace_memory(query: str, source: str = "mempalace") -> str
         source_part = f" {source_file}" if source_file else ""
         lines.append(f"- {namespace}{source_part} match={similarity}: {text[:360]}")
     return "\n".join(lines)[:1900]
+
+
+async def _run_mempalace_search(query: str, *, wing: str | None, results: int, timeout_sec: float) -> tuple[dict[str, Any], float]:
+    cmd = [
+        MEMPALACE_PYTHON,
+        MEMPALACE_READONLY_SCRIPT,
+        "search",
+        query[:500],
+        "--results",
+        str(max(1, min(results, 8))),
+    ]
+    if wing:
+        cmd.extend(["--wing", wing])
+
+    started = time.perf_counter()
+    proc = None
+    try:
+        env = os.environ.copy()
+        env["HOME"] = "/tmp"
+        env["XDG_CACHE_HOME"] = "/tmp"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError as exc:
+        if proc is not None:
+            with suppress(Exception):
+                proc.kill()
+            with suppress(Exception):
+                await proc.wait()
+        raise TimeoutError("MemPalace search timed out") from exc
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()[:300]
+        raise RuntimeError(f"MemPalace search failed.{f' Detail: {detail}' if detail else ''}")
+
+    try:
+        payload = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("MemPalace search returned an unreadable response.") from exc
+    return payload, elapsed_ms
 
 
 def _looks_like_secret_memory_query(query: str) -> bool:
@@ -1629,6 +1666,109 @@ def _mempalace_query_terms(query: str) -> list[str]:
         for term in re.findall(r"[A-Za-z0-9_/-]{4,}", query)
         if term.lower() not in stop_words
     ]
+
+
+def _should_use_project_mempalace(prompt: str) -> bool:
+    normalized = prompt.lower()
+    project_terms = (
+        "/",
+        "agent",
+        "ask",
+        "codex",
+        "discord",
+        "mempalace",
+        "memory",
+        "model",
+        "news flash",
+        "newsflash",
+        "ollama",
+        "phase",
+        "project",
+        "schedule",
+        "task",
+        "tool",
+        "vps",
+    )
+    return any(term in normalized for term in project_terms)
+
+
+async def _project_mempalace_context(prompt: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    metrics: dict[str, Any] = {
+        "enabled": ASK_MEMPALACE_ENABLED and ASK_MEMPALACE_PROJECT_ENABLED,
+        "attempted": False,
+        "hit_count": 0,
+        "context_chars": 0,
+        "elapsed_ms": 0,
+        "status": "disabled",
+    }
+    if not metrics["enabled"]:
+        return [], metrics
+    if not _should_use_project_mempalace(prompt):
+        metrics["status"] = "skipped_not_project_intent"
+        return [], metrics
+    if _looks_like_secret_memory_query(prompt):
+        metrics["status"] = "skipped_secret_query"
+        return [], metrics
+
+    metrics["attempted"] = True
+    try:
+        payload, elapsed_ms = await _run_mempalace_search(
+            prompt,
+            wing="project_ops",
+            results=4,
+            timeout_sec=ASK_MEMPALACE_TIMEOUT_SEC,
+        )
+    except TimeoutError:
+        metrics["status"] = "timeout"
+        metrics["elapsed_ms"] = round(ASK_MEMPALACE_TIMEOUT_SEC * 1000, 2)
+        return [], metrics
+    except Exception as exc:
+        logger.info("ask mempalace project context skipped: %s", exc)
+        metrics["status"] = type(exc).__name__
+        return [], metrics
+
+    ranked = sorted(
+        payload.get("results") or [],
+        key=lambda hit: 0 if str(hit.get("room") or "") == "project_facts" else 1,
+    )
+    terms = _mempalace_query_terms(prompt)
+    fact_hits = [
+        hit
+        for hit in ranked
+        if str(hit.get("room") or "") == "project_facts"
+        and (not terms or any(term in str(hit.get("text") or "").lower() for term in terms))
+    ]
+    if fact_hits:
+        ranked = fact_hits
+
+    items: list[dict[str, str]] = []
+    remaining_chars = max(200, ASK_MEMPALACE_MAX_CONTEXT_CHARS)
+    for hit in ranked[:2]:
+        text = _format_mempalace_snippet(str(hit.get("text") or ""), prompt)
+        if not text:
+            continue
+        text = text[:remaining_chars]
+        remaining_chars -= len(text)
+        items.append(
+            {
+                "role": "project_fact",
+                "content": text,
+                "source": str(hit.get("source_file") or ""),
+                "namespace": f"{hit.get('wing', '?')}/{hit.get('room', '?')}",
+            }
+        )
+        if remaining_chars <= 0:
+            break
+
+    metrics.update(
+        {
+            "status": "completed",
+            "hit_count": len(items),
+            "context_chars": sum(len(item["content"]) for item in items),
+            "elapsed_ms": elapsed_ms,
+        }
+    )
+    return items, metrics
 
 
 async def _record_memory_event(ctx: dict[str, str], event_type: str, content: str, metadata: dict | None = None) -> None:
@@ -1898,10 +2038,12 @@ async def _relevant_memory(ctx: dict[str, str], prompt: str, limit: int = RELEVA
 
 async def _build_agent_context(ctx: dict[str, str], prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
     started = time.perf_counter()
-    recent, relevant = await asyncio.gather(
+    recent, relevant, project_memories_result = await asyncio.gather(
         _recent_memory(ctx),
         _relevant_memory(ctx, prompt),
+        _project_mempalace_context(prompt),
     )
+    project_memories, mempalace_metrics = project_memories_result
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     context = {
         "memory_version": 1,
@@ -1909,11 +2051,14 @@ async def _build_agent_context(ctx: dict[str, str], prompt: str) -> tuple[dict[s
         "relevant_limit": RELEVANT_MEMORY_LIMIT,
         "recent_messages": recent,
         "relevant_memories": relevant,
+        "project_memories": project_memories,
     }
     metrics = {
         "memory_ms": elapsed_ms,
         "recent_count": len(recent),
         "relevant_count": len(relevant),
+        "mempalace_project": mempalace_metrics,
+        "mempalace_user": {"enabled": ASK_MEMPALACE_ENABLED and ASK_MEMPALACE_USER_ENABLED, "status": "disabled"},
     }
     return context, metrics
 

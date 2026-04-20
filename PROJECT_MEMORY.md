@@ -72,3 +72,10 @@ The memory pipeline redacts likely secrets before sanitized imports. Discord
 memory search should only provide harmless operational guidance for credential
 topics. API keys, bot tokens, webhook shared secrets, environment values, and
 credentials must stay outside Discord-visible memory responses.
+
+## Server-scoped tools
+
+Future user-added tools must be scoped by Discord guild/server. Tool definitions
+may store names, descriptions, classifications, and non-secret configuration,
+but they must reference credentials indirectly and must not expose one server's
+credentials, memory, or chat context to another server.
