@@ -17,9 +17,13 @@ from typing import Any
 
 DEFAULT_PALACE = Path("/opt/dcss-n8n/labs/mempalace/palace-readonly-trial")
 ALLOWED_ROOT = Path("/opt/dcss-n8n/labs/mempalace").resolve()
+VENV_SITE_PACKAGES = Path("/opt/dcss-n8n/labs/mempalace/.venv/lib/python3.12/site-packages")
 MAX_QUERY_CHARS = 500
 MAX_RESULTS = 8
 MAX_TEXT_CHARS = 1200
+
+if VENV_SITE_PACKAGES.exists():
+    sys.path.insert(0, str(VENV_SITE_PACKAGES))
 
 
 def _resolve_palace(path: str | None) -> Path:

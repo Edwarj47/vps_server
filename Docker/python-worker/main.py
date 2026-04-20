@@ -6,7 +6,7 @@ import re
 import socket
 import time
 import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -79,6 +79,10 @@ CODEX_ALLOWED_WORKDIRS = [
     for path in os.getenv("CODEX_ALLOWED_WORKDIRS", "/opt/dcss-n8n,/home/codexvps/Desktop").split(",")
     if path.strip()
 ]
+MEMPALACE_READONLY_ENABLED = os.getenv("MEMPALACE_READONLY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+MEMPALACE_PYTHON = os.getenv("MEMPALACE_PYTHON", "/usr/local/bin/python")
+MEMPALACE_READONLY_SCRIPT = os.getenv("MEMPALACE_READONLY_SCRIPT", "/opt/dcss-n8n/scripts/mempalace-readonly.py")
+MEMPALACE_SEARCH_TIMEOUT_SEC = float(os.getenv("MEMPALACE_SEARCH_TIMEOUT_SEC", "5"))
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -1459,6 +1463,68 @@ async def _search_memory(ctx: dict[str, str], query: str) -> str:
     return "\n".join(lines)
 
 
+async def _search_mempalace_memory(query: str, source: str = "mempalace") -> str:
+    if not MEMPALACE_READONLY_ENABLED:
+        return "MemPalace search is disabled."
+    if len(query) < 3:
+        return "Give me at least 3 characters to search memory."
+
+    wing = "project_ops" if source == "project" else None
+    cmd = [
+        MEMPALACE_PYTHON,
+        MEMPALACE_READONLY_SCRIPT,
+        "search",
+        query[:500],
+        "--results",
+        "4",
+    ]
+    if wing:
+        cmd.extend(["--wing", wing])
+
+    proc = None
+    try:
+        env = os.environ.copy()
+        env["HOME"] = "/tmp"
+        env["XDG_CACHE_HOME"] = "/tmp"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MEMPALACE_SEARCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            with suppress(Exception):
+                proc.kill()
+        return "MemPalace search timed out."
+    except Exception as exc:
+        logger.exception("mempalace search failed")
+        return f"MemPalace search failed: {type(exc).__name__}"
+
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()[:300]
+        return f"MemPalace search failed.{f' Detail: {detail}' if detail else ''}"
+
+    try:
+        payload = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return "MemPalace search returned an unreadable response."
+
+    hits = payload.get("results") or []
+    if not hits:
+        return "No matching MemPalace memory found."
+
+    label = "project_ops" if wing else "MemPalace"
+    lines = [f"{label} memory matches:"]
+    for hit in hits[:4]:
+        text = " ".join(str(hit.get("text") or "").split())
+        namespace = f"{hit.get('wing', '?')}/{hit.get('room', '?')}"
+        similarity = hit.get("similarity")
+        lines.append(f"- {namespace} match={similarity}: {text[:260]}")
+    return "\n".join(lines)[:1900]
+
+
 async def _record_memory_event(ctx: dict[str, str], event_type: str, content: str, metadata: dict | None = None) -> None:
     if DB_POOL is None:
         return
@@ -2156,8 +2222,13 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
         elif command == "schedule":
             content = await _handle_schedule_command(ctx, payload)
         elif command == "memory":
-            content = await _search_memory(ctx, prompt)
-            await _record_memory_event(ctx, "search", prompt, {"command": command})
+            source = str(_option_value(payload, "source") or "postgres").strip().lower()
+            if source in {"mempalace", "project"}:
+                content = await _search_mempalace_memory(prompt, source)
+            else:
+                source = "postgres"
+                content = await _search_memory(ctx, prompt)
+            await _record_memory_event(ctx, "search", prompt, {"command": command, "source": source})
         elif command == "research":
             if len(prompt) < 3:
                 content = "Give me at least 3 characters to research."

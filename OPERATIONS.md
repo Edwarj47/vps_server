@@ -128,7 +128,7 @@ Supported slash-command names in the Phase 1 router:
 - `/ask`: forwards to the existing n8n Ollama webhook with router-supplied memory context. The n8n workflow remains the single writer for chat memory.
 - `/research`: performs constrained web research with source URLs, public HTTP(S) only, private-network blocking, byte/time/source limits, and `agent_tool_calls` audit records.
 - `/newsflash`: summarizes latest tech and AI feed items from configured RSS/Atom sources. It is deterministic and does not pass feed text through Ollama.
-- `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
+- `/memory`: searches memory. Default `source:postgres` searches the calling user's `discord_chat_memory` rows; `source:mempalace` searches the read-only trial palace; `source:project` searches only the `project_ops` MemPalace wing.
 - `/task`: records a queued job in `agent_jobs`; the Phase 2 worker executes allowed internal tools and posts a Discord completion update.
 - `/codex`: records an approval-oriented queued job in `agent_jobs`; the Phase 2 worker creates a pending approval record.
 - `/approve`: marks a pending approval as approved or denied. Approval can write a Codex handoff file, but it does not execute Codex/VPS work.
@@ -202,11 +202,13 @@ Read-only MemPalace trial:
 - Wrapper: `scripts/mempalace-readonly.py`
 - Import tool: `scripts/mempalace-import-discord-memory.py`
 - Eval tool: `scripts/eval-memory-retrieval.py`
+- Discord test plan: `MEMORY_TEST_PLAN.md`
 - Trial palace: `/opt/dcss-n8n/labs/mempalace/palace-readonly-trial`
 - Latest sanitized Discord import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_092407`
 - Latest project docs import: `/opt/dcss-n8n/labs/mempalace/imports/project-docs-20260420_092443`
 - Latest eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_092510.md`
 - The wrapper exposes only `status`, `namespaces`, and `search`. It contains no write, delete, hook, or mutation path.
+- Discord can query the wrapper explicitly through `/memory source:mempalace` or `/memory source:project`; `/ask` does not use MemPalace automatically.
 - Run the wrapper with the MemPalace virtualenv Python:
   `labs/mempalace/.venv/bin/python scripts/mempalace-readonly.py status`
 - Rebuild the trial palace from sanitized Discord memory:
@@ -269,6 +271,8 @@ Worker tuning environment variables:
 - `AGENT_APPROVER_USER_IDS=` optional comma-separated Discord user allowlist. If unset, only the job owner can approve or deny their pending approval.
 - `CODEX_JOB_QUEUE_DIR=/codex-jobs`
 - `CODEX_ALLOWED_WORKDIRS=/opt/dcss-n8n,/home/codexvps/Desktop`
+- `MEMPALACE_READONLY_ENABLED=true`
+- `MEMPALACE_SEARCH_TIMEOUT_SEC=5`
 - `NEWS_FLASH_SOURCES=` semicolon-separated `Name=https://feed-url` entries.
 - `NEWS_FLASH_MAX_ITEMS=8`
 - `NEWS_FLASH_TIMEOUT_SEC=8`

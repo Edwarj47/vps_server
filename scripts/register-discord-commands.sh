@@ -58,6 +58,26 @@ curl -fsS \
         "description": "Text to search for",
         "type": 3,
         "required": true
+      },
+      {
+        "name": "source",
+        "description": "Memory source to search",
+        "type": 3,
+        "required": false,
+        "choices": [
+          {
+            "name": "postgres",
+            "value": "postgres"
+          },
+          {
+            "name": "mempalace",
+            "value": "mempalace"
+          },
+          {
+            "name": "project",
+            "value": "project"
+          }
+        ]
       }
     ]
   },
