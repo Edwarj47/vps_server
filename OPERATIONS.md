@@ -197,6 +197,23 @@ MemPalace sandbox:
 - The default MemPalace MCP server exposes write/destructive tools such as drawer deletion, drawer updates, diary writes, hook settings, and knowledge-graph mutation. Do not expose the default MCP server directly to the production agent.
 - Production gate: add a read-only MCP proxy/tool allowlist first, keep write tools behind explicit approval, keep hooks disabled, and ingest only redacted copies created by `scripts/mempalace-redact.py`.
 
+Read-only MemPalace trial:
+
+- Wrapper: `scripts/mempalace-readonly.py`
+- Import tool: `scripts/mempalace-import-discord-memory.py`
+- Eval tool: `scripts/eval-memory-retrieval.py`
+- Trial palace: `/opt/dcss-n8n/labs/mempalace/palace-readonly-trial`
+- Latest sanitized import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_032427`
+- Full eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_032525.md`
+- The wrapper exposes only `status`, `namespaces`, and `search`. It contains no write, delete, hook, or mutation path.
+- Run the wrapper with the MemPalace virtualenv Python:
+  `labs/mempalace/.venv/bin/python scripts/mempalace-readonly.py status`
+- Rebuild the trial palace from sanitized Discord memory:
+  `scripts/mempalace-import-discord-memory.py --limit 250 --wing discord_memory`
+- Compare current Postgres memory lookup to MemPalace:
+  `scripts/eval-memory-retrieval.py --limit 5`
+- Do not wire MemPalace into `/memory` or `/ask` until manual eval review confirms quality. The first trial shows useful semantic recall, but some retrieved chunks are noisy because old Discord memory includes test prompts and research snippets.
+
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
 The n8n workflow validates `x-n8n-shared-secret` from the `N8N_WEBHOOK_SHARED_SECRET` environment variable. Do not hardcode this value in workflow JSON or scripts. Rotate it after any suspected exposure, then recreate both `n8n` and `python-worker`.
