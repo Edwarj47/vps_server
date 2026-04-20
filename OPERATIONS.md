@@ -152,6 +152,8 @@ MemPalace project facts are intentionally attached only for likely project quest
 
 The router also has a deterministic fast path for common project/security questions such as current model, `/task`, Codex authority, News Flash, MemPalace gate, schedules, server-scoped tools, and secret requests. These responses bypass n8n/Ollama to avoid slow local inference for facts already controlled by the stack.
 
+Open-ended `/ask` prompts that still need n8n/Ollama are serialized by `ASK_N8N_CONCURRENCY` so slow local inference does not stampede the VPS. The n8n HTTP timeout starts after a request gets the queue slot; `queue_wait_ms` is recorded in job timing metadata.
+
 The chat model is configured with `OLLAMA_CHAT_MODEL` in `/opt/dcss-n8n/Docker/.env`. Use the sync script below so the `.env`, tracked workflow export, and active n8n workflow records all agree:
 
 ```bash
@@ -291,6 +293,8 @@ Worker tuning environment variables:
 - `ASK_MEMPALACE_USER_ENABLED=false`
 - `ASK_MEMPALACE_TIMEOUT_SEC=8`
 - `ASK_MEMPALACE_MAX_CONTEXT_CHARS=1200`
+- `ASK_N8N_CONCURRENCY=1`
+- `ASK_QUEUE_TIMEOUT_SEC=600`
 - `NEWS_FLASH_SOURCES=` semicolon-separated `Name=https://feed-url` entries.
 - `NEWS_FLASH_MAX_ITEMS=8`
 - `NEWS_FLASH_TIMEOUT_SEC=8`

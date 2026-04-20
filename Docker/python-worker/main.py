@@ -88,6 +88,8 @@ ASK_MEMPALACE_PROJECT_ENABLED = os.getenv("ASK_MEMPALACE_PROJECT_ENABLED", "true
 ASK_MEMPALACE_USER_ENABLED = os.getenv("ASK_MEMPALACE_USER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ASK_MEMPALACE_TIMEOUT_SEC = float(os.getenv("ASK_MEMPALACE_TIMEOUT_SEC", "8"))
 ASK_MEMPALACE_MAX_CONTEXT_CHARS = int(os.getenv("ASK_MEMPALACE_MAX_CONTEXT_CHARS", "1200"))
+ASK_N8N_CONCURRENCY = max(1, int(os.getenv("ASK_N8N_CONCURRENCY", "1")))
+ASK_QUEUE_TIMEOUT_SEC = float(os.getenv("ASK_QUEUE_TIMEOUT_SEC", "600"))
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -101,6 +103,7 @@ except ValueError as exc:
 
 DB_POOL: asyncpg.Pool | None = None
 WORKER_TASK: asyncio.Task | None = None
+ASK_N8N_SEMAPHORE = asyncio.Semaphore(ASK_N8N_CONCURRENCY)
 
 CODEX_ROUTE_POLICY = "Only the explicit Discord /codex command may create Codex jobs."
 
@@ -2184,6 +2187,26 @@ async def _forward_to_n8n(raw_body: bytes, agent_context: dict[str, Any] | None 
         }
 
 
+async def _forward_ask_to_n8n_queued(raw_body: bytes, agent_context: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+    queued_started = time.perf_counter()
+    acquired = False
+    try:
+        await asyncio.wait_for(ASK_N8N_SEMAPHORE.acquire(), timeout=ASK_QUEUE_TIMEOUT_SEC)
+        acquired = True
+        queue_wait_ms = round((time.perf_counter() - queued_started) * 1000, 2)
+        content, metrics = await _forward_to_n8n(raw_body, agent_context)
+        metrics["queue_wait_ms"] = queue_wait_ms
+        metrics["ask_n8n_concurrency"] = ASK_N8N_CONCURRENCY
+        return content, metrics
+    except asyncio.TimeoutError as exc:
+        if not acquired:
+            raise TimeoutError("ask queue wait timed out") from exc
+        raise
+    finally:
+        if acquired:
+            ASK_N8N_SEMAPHORE.release()
+
+
 async def _send_followup(ctx: dict[str, str], content: str) -> None:
     app_id = ctx.get("application_id")
     token = ctx.get("token")
@@ -2627,7 +2650,7 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                 if prompt:
                     agent_context, metrics = await _build_agent_context(ctx, prompt)
                 try:
-                    content, n8n_metrics = await _forward_to_n8n(raw_body, agent_context)
+                    content, n8n_metrics = await _forward_ask_to_n8n_queued(raw_body, agent_context)
                     metrics.update(n8n_metrics)
                     metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
                     await _record_tool_call(
@@ -2640,6 +2663,25 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                             "relevant_count": metrics.get("relevant_count", 0),
                         },
                         output_json=metrics,
+                    )
+                except TimeoutError:
+                    metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
+                    metrics["n8n_status"] = "queue_timeout"
+                    content = (
+                        "The local Ollama chat queue is backed up and this request waited too long to start. "
+                        "Try again shortly, or use a project/status question that the faster router can answer directly."
+                    )
+                    await _record_tool_call(
+                        job_id,
+                        "n8n_ollama_chat",
+                        "failed",
+                        input_json={
+                            "prompt_chars": len(prompt),
+                            "recent_count": metrics.get("recent_count", 0),
+                            "relevant_count": metrics.get("relevant_count", 0),
+                        },
+                        output_json=metrics,
+                        error_detail="QueueTimeout",
                     )
                 except httpx.ReadTimeout:
                     metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
