@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
@@ -72,6 +73,12 @@ DEFAULT_NEWS_FLASH_SOURCES = (
 NEWS_FLASH_SOURCES = os.getenv("NEWS_FLASH_SOURCES", "").strip() or DEFAULT_NEWS_FLASH_SOURCES
 NEWS_FLASH_MAX_ITEMS = int(os.getenv("NEWS_FLASH_MAX_ITEMS", "8"))
 NEWS_FLASH_TIMEOUT_SEC = float(os.getenv("NEWS_FLASH_TIMEOUT_SEC", "8"))
+CODEX_JOB_QUEUE_DIR = os.getenv("CODEX_JOB_QUEUE_DIR", "").strip()
+CODEX_ALLOWED_WORKDIRS = [
+    Path(path).resolve()
+    for path in os.getenv("CODEX_ALLOWED_WORKDIRS", "/opt/dcss-n8n,/home/codexvps/Desktop").split(",")
+    if path.strip()
+]
 
 if not DISCORD_PUBLIC_KEY:
     raise RuntimeError("DISCORD_PUBLIC_KEY is required")
@@ -1055,6 +1062,66 @@ async def _insert_approval(job_id: int | None, requested_by: str, reason: str) -
         )
 
 
+def _codex_session_mode(prompt: str) -> str:
+    normalized = prompt.lower()
+    if re.search(r"\bresume\b|\bcontinue\b|\bexisting\s+(chat|session)\b", normalized):
+        return "resume_requested"
+    if re.search(r"\bnew\s+(chat|session)\b|\bfresh\s+(chat|session)\b", normalized):
+        return "new_requested"
+    return "unspecified_manual_review"
+
+
+def _codex_requested_workdir(prompt: str) -> str | None:
+    match = re.search(r"(?:^|\s)(?:dir|directory|cwd|workdir)\s*[:=]\s*([^\s`]+)", prompt, re.I)
+    if not match:
+        return None
+    candidate = Path(match.group(1)).expanduser()
+    if not candidate.is_absolute():
+        return None
+    resolved = candidate.resolve()
+    for allowed in CODEX_ALLOWED_WORKDIRS:
+        if resolved == allowed or allowed in resolved.parents:
+            return str(resolved)
+    return None
+
+
+def _write_codex_handoff(job: asyncpg.Record, approved_by: str) -> str | None:
+    if not CODEX_JOB_QUEUE_DIR:
+        return None
+
+    queue_root = Path(CODEX_JOB_QUEUE_DIR).resolve()
+    approved_dir = queue_root / "approved"
+    approved_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt = str(job["prompt"] or "")
+    payload = {
+        "schema_version": 1,
+        "job_id": int(job["id"]),
+        "status": "approved_ready_for_manual_codex",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": str(job["user_id"] or ""),
+        "approved_by": approved_by,
+        "guild_id": str(job["guild_id"] or ""),
+        "channel_id": str(job["channel_id"] or ""),
+        "session_mode": _codex_session_mode(prompt),
+        "requested_workdir": _codex_requested_workdir(prompt),
+        "allowed_workdirs": [str(path) for path in CODEX_ALLOWED_WORKDIRS],
+        "prompt": prompt,
+        "execution_policy": {
+            "auto_start_codex": False,
+            "auto_resume_session": False,
+            "requires_human_or_codexvps_pickup": True,
+            "notes": "This file is a handoff contract only. The Discord worker must not spawn shells or Codex sessions.",
+        },
+    }
+
+    path = approved_dir / f"codex-job-{int(job['id']):06d}.json"
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+    return str(path)
+
+
 async def _decide_approval(ctx: dict[str, str], job_id: int, decision: str) -> str:
     if DB_POOL is None:
         return "Approval updates are unavailable because Postgres is not connected."
@@ -1070,7 +1137,7 @@ async def _decide_approval(ctx: dict[str, str], job_id: int, decision: str) -> s
         async with conn.transaction():
             job = await conn.fetchrow(
                 """
-                select id, command, status, user_id, requires_approval
+                select id, command, status, user_id, guild_id, channel_id, prompt, requires_approval
                 from agent_jobs
                 where id = $1
                 for update
@@ -1101,23 +1168,35 @@ async def _decide_approval(ctx: dict[str, str], job_id: int, decision: str) -> s
             if approval_id is None:
                 return f"Job #{job_id} has no pending approval."
 
+            handoff_path = _write_codex_handoff(job, ctx["user_id"]) if approved and job["command"] == "codex" else None
+            result_summary = (
+                f"Approved and wrote Codex handoff file: {handoff_path}"
+                if handoff_path
+                else (
+                    "Approved for future Codex bridge execution. No execution was started."
+                    if approved
+                    else "Approval denied. No execution was started."
+                )
+            )
+            metadata_update = {"codex_handoff": {"path": handoff_path, "status": "ready_for_manual_pickup"}} if handoff_path else {}
+
             await conn.execute(
                 """
                 update agent_jobs
-                set status = $2, result_summary = $3, updated_at = now()
+                set status = $2,
+                    result_summary = $3,
+                    metadata_json = metadata_json || $4::jsonb,
+                    updated_at = now()
                 where id = $1
                 """,
                 job_id,
                 new_job_status,
-                (
-                    "Approved for future Codex bridge execution. No execution was started."
-                    if approved
-                    else "Approval denied. No execution was started."
-                ),
+                result_summary,
+                json.dumps(metadata_update),
             )
 
     return (
-        f"Approved job #{job_id}. No Codex/VPS execution bridge is enabled yet."
+        f"Approved job #{job_id}. Codex handoff file is ready for manual pickup; no subprocess was started."
         if approved
         else f"Denied job #{job_id}. No execution was started."
     )
@@ -2026,7 +2105,7 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
     elif command == "codex":
         risk_level = "approval_required"
         requires_approval = True
-        initial_status = "queued"
+        initial_status = "pending_approval"
         job_metadata = {
             "phase": "agent-worker-v1",
             "discord": {
@@ -2113,6 +2192,22 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                 await _finish_job(job_id, "rejected", content)
                 await _audit_interaction(ctx, "rejected", prompt, model=f"router:{command}")
                 return content
+            if command == "codex":
+                await _insert_approval(job_id, ctx["user_id"], "Codex/VPS execution requires approval before Phase 4 bridge work.")
+                await _record_tool_call(
+                    job_id,
+                    "approval_gate",
+                    "completed",
+                    classification="approval_required",
+                    input_json={"command": "codex"},
+                    output_json={"approval_status": "pending", "handoff_after_approval": bool(CODEX_JOB_QUEUE_DIR)},
+                )
+                await _audit_interaction(ctx, "pending_approval", prompt, model="router:codex")
+                return (
+                    f"Codex job #{job_id} is waiting for approval.\n"
+                    f"Risk class: `{risk_level}`.\n"
+                    "Approval can create a handoff file for manual pickup; no subprocess will be started."
+                )
             await _audit_interaction(ctx, "queued", prompt, model=f"router:{command}")
             if command == "task" and schedule:
                 repeat = f"\nRepeat: `{schedule['recurrence_rule']}`." if schedule["recurrence_rule"] else ""

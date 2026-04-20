@@ -28,6 +28,7 @@ DEFAULT_QUERIES = [
     "News Flash Hacker News OpenAI Anthropic",
     "scheduled tasks daily at 10am",
     "prompt injection treated as untrusted",
+    "what is the assistant name and purpose",
 ]
 
 

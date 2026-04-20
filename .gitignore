@@ -5,6 +5,15 @@
 backups/
 labs/
 model-evals/
+codex-jobs/**
+!codex-jobs/
+!codex-jobs/.gitkeep
+!codex-jobs/approved/
+!codex-jobs/approved/.gitkeep
+!codex-jobs/completed/
+!codex-jobs/completed/.gitkeep
+!codex-jobs/rejected/
+!codex-jobs/rejected/.gitkeep
 Docker/python-worker/__pycache__/
 Docker/python-worker/*.pyc
 Docker/python-worker/.pytest_cache/

@@ -48,6 +48,12 @@ def _export_rows(limit: int, user_id: str | None) -> list[dict]:
     if user_id:
         escaped_user_id = user_id.replace("'", "''")
         where += f" and user_id = '{escaped_user_id}'"
+    else:
+        where += """
+ and coalesce(user_id, '') !~* '(test|manual|local|injection|route|smoke)'
+ and coalesce(session_id, '') !~* '(test|manual|local|injection|route|smoke)'
+ and coalesce(metadata_json->>'interaction_id', '') !~* '(test|manual|local|route|injection|smoke)'
+"""
     sql = f"""
 select jsonb_build_object(
   'id', id,

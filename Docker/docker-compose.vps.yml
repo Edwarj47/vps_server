@@ -108,10 +108,14 @@ services:
       NEWS_FLASH_SOURCES: ${NEWS_FLASH_SOURCES:-}
       NEWS_FLASH_MAX_ITEMS: ${NEWS_FLASH_MAX_ITEMS:-8}
       NEWS_FLASH_TIMEOUT_SEC: ${NEWS_FLASH_TIMEOUT_SEC:-8}
+      CODEX_JOB_QUEUE_DIR: /codex-jobs
+      CODEX_ALLOWED_WORKDIRS: ${CODEX_ALLOWED_WORKDIRS:-/opt/dcss-n8n,/home/codexvps/Desktop}
       DISCORD_MAX_TIMESTAMP_AGE_SEC: ${DISCORD_MAX_TIMESTAMP_AGE_SEC:-300}
       N8N_PROXY_TIMEOUT_SEC: ${N8N_PROXY_TIMEOUT_SEC:-10}
       LOG_LEVEL: ${PYTHON_WORKER_LOG_LEVEL:-INFO}
       TZ: ${TZ}
+    volumes:
+      - ../codex-jobs:/codex-jobs
     ports:
       - "127.0.0.1:8001:8000"
     depends_on:

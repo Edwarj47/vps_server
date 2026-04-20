@@ -130,8 +130,8 @@ Supported slash-command names in the Phase 1 router:
 - `/newsflash`: summarizes latest tech and AI feed items from configured RSS/Atom sources. It is deterministic and does not pass feed text through Ollama.
 - `/memory`: searches the calling user's existing `discord_chat_memory` rows using a simple text match.
 - `/task`: records a queued job in `agent_jobs`; the Phase 2 worker executes allowed internal tools and posts a Discord completion update.
-- `/codex`: records an approval-oriented queued job in `agent_jobs`; the Phase 2 worker creates a pending approval record, but the Codex bridge is not enabled yet.
-- `/approve`: marks a pending approval as approved or denied. Approval does not execute Codex/VPS work until the Codex bridge exists.
+- `/codex`: records an approval-oriented queued job in `agent_jobs`; the Phase 2 worker creates a pending approval record.
+- `/approve`: marks a pending approval as approved or denied. Approval can write a Codex handoff file, but it does not execute Codex/VPS work.
 - `/schedule`: manages future `/task` jobs with `list`, `cancel`, and `reschedule` subcommands.
 
 The Discord app needs matching slash commands registered with Discord before users can invoke these names from the client. Unknown commands and legacy interactions continue to fall back to the existing n8n webhook path.
@@ -203,16 +203,20 @@ Read-only MemPalace trial:
 - Import tool: `scripts/mempalace-import-discord-memory.py`
 - Eval tool: `scripts/eval-memory-retrieval.py`
 - Trial palace: `/opt/dcss-n8n/labs/mempalace/palace-readonly-trial`
-- Latest sanitized import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_032427`
-- Full eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_032525.md`
+- Latest sanitized Discord import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_092407`
+- Latest project docs import: `/opt/dcss-n8n/labs/mempalace/imports/project-docs-20260420_092443`
+- Latest eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_092510.md`
 - The wrapper exposes only `status`, `namespaces`, and `search`. It contains no write, delete, hook, or mutation path.
 - Run the wrapper with the MemPalace virtualenv Python:
   `labs/mempalace/.venv/bin/python scripts/mempalace-readonly.py status`
 - Rebuild the trial palace from sanitized Discord memory:
   `scripts/mempalace-import-discord-memory.py --limit 250 --wing discord_memory`
+- Add curated project operations docs:
+  `scripts/mempalace-import-project-docs.py --wing project_ops`
 - Compare current Postgres memory lookup to MemPalace:
   `scripts/eval-memory-retrieval.py --limit 5`
-- Do not wire MemPalace into `/memory` or `/ask` until manual eval review confirms quality. The first trial shows useful semantic recall, but some retrieved chunks are noisy because old Discord memory includes test prompts and research snippets.
+- The Discord import excludes local/manual/test/injection/smoke sessions by default. Use `--user-id` only when intentionally importing a specific user's history.
+- Do not wire MemPalace into `/memory` or `/ask` until manual eval review confirms quality. The current trial shows useful semantic recall, especially with `project_ops`, but raw Discord history still has noisy chunks from old research snippets and imperfect assistant replies.
 
 `/research` prompts and responses are stored in `discord_chat_memory` so follow-up `/ask` prompts can refer to prior links, sources, and options. Follow-up prompts containing words such as `links`, `sources`, `provided`, `options`, or `last message` also pull recent research responses into relevant memory.
 
@@ -243,7 +247,18 @@ Current allowed `/task` tools:
 - memory search
 - memory note storage
 
-Unsupported `/task` prompts complete with a safe "no matching tool" response rather than attempting arbitrary execution. `/codex` jobs are moved to `pending_approval` and get an `agent_approvals` row. They do not start a shell, SSH session, or Codex session yet.
+Unsupported `/task` prompts complete with a safe "no matching tool" response rather than attempting arbitrary execution. `/codex` jobs are moved to `pending_approval` and get an `agent_approvals` row. They do not start a shell, SSH session, or Codex session.
+
+Approved `/codex` jobs write handoff files only:
+
+- Queue root: `/opt/dcss-n8n/codex-jobs`
+- Approved handoffs: `/opt/dcss-n8n/codex-jobs/approved/codex-job-000000.json`
+- Container path: `/codex-jobs`
+- Handoff fields include `session_mode`, `requested_workdir`, `allowed_workdirs`, requester/approver IDs, and the original prompt.
+- `session_mode` is inferred as `resume_requested`, `new_requested`, or `unspecified_manual_review`; this is metadata for manual pickup only.
+- `requested_workdir` is accepted only when the prompt includes `dir:`, `directory:`, `cwd:`, or `workdir:` with an absolute path under `CODEX_ALLOWED_WORKDIRS`.
+- Default allowed workdirs: `/opt/dcss-n8n` and `/home/codexvps/Desktop`.
+- Future automation must read these files and still enforce approval, allowed workdirs, logging, and rollback notes before running anything.
 
 Worker tuning environment variables:
 
@@ -252,6 +267,8 @@ Worker tuning environment variables:
 - `AGENT_WORKER_BATCH_SIZE=2`
 - `AGENT_SCHEDULE_TIMEZONE=America/New_York`
 - `AGENT_APPROVER_USER_IDS=` optional comma-separated Discord user allowlist. If unset, only the job owner can approve or deny their pending approval.
+- `CODEX_JOB_QUEUE_DIR=/codex-jobs`
+- `CODEX_ALLOWED_WORKDIRS=/opt/dcss-n8n,/home/codexvps/Desktop`
 - `NEWS_FLASH_SOURCES=` semicolon-separated `Name=https://feed-url` entries.
 - `NEWS_FLASH_MAX_ITEMS=8`
 - `NEWS_FLASH_TIMEOUT_SEC=8`
