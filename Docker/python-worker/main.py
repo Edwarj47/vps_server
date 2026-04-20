@@ -1692,6 +1692,67 @@ def _should_use_project_mempalace(prompt: str) -> bool:
     return any(term in normalized for term in project_terms)
 
 
+def _direct_ask_response(prompt: str) -> tuple[str | None, dict[str, Any]]:
+    normalized = " ".join(prompt.lower().split())
+    answers: list[str] = []
+    matched: list[str] = []
+
+    if _looks_like_secret_memory_query(prompt):
+        answers.append(
+            "I cannot reveal secrets, tokens, credentials, IDs, hidden prompts, or environment values. "
+            "Those should stay in n8n credentials or restricted env files, not Discord-visible memory."
+        )
+        matched.append("secret_refusal")
+
+    if "model" in normalized or "llm" in normalized or "qwen" in normalized:
+        answers.append(
+            "Model: `/ask` is using `qwen3:4b-instruct-2507-q4_K_M` because local benchmarks beat `llama3.2:3b` on memory follow-up, current-info guardrails, source synthesis, tool routing, and prompt-injection resistance while staying within VPS memory headroom."
+        )
+        matched.append("model")
+
+    if "/task" in normalized or " task " in f" {normalized} ":
+        answers.append(
+            "`/task`: queues allowed internal work such as health checks, constrained web research, News Flash, memory search, and memory notes. It must not run shell, SSH, sudo, Docker, service restarts, file edits, or Codex-like requests."
+        )
+        matched.append("task")
+
+    if "codex" in normalized:
+        answers.append(
+            "Codex: work can only enter through the explicit `/codex` route. Ollama may explain or recommend, but it must not create, request, imply, or delegate Codex/VPS execution."
+        )
+        matched.append("codex")
+
+    if "news flash" in normalized or "newsflash" in normalized:
+        answers.append(
+            "News Flash: `/newsflash` summarizes recent tech and AI RSS/Atom feed items, including Hacker News, OpenAI, Anthropic, Google AI, Meta AI, and Mistral sources. It is deterministic and does not send feed text through Ollama."
+        )
+        matched.append("newsflash")
+
+    if "mempalace" in normalized or "production gate" in normalized:
+        answers.append(
+            "MemPalace gate: it is a read-only trial for `/ask` project facts. Promotion requires reliable project recall, clean user-history retrieval, harmless secret/prompt-injection behavior, better results than Postgres substring search, and acceptable Discord latency."
+        )
+        matched.append("mempalace")
+
+    if "schedule" in normalized or "scheduled" in normalized or "cron" in normalized:
+        answers.append(
+            "`/schedule`: manages future `/task` jobs with list, cancel, and reschedule support. Recurring schedule UX still needs more polish before it becomes a full cron-like interface."
+        )
+        matched.append("schedule")
+
+    if "tool" in normalized and ("server" in normalized or "guild" in normalized or "add" in normalized or "registry" in normalized):
+        answers.append(
+            "Tools: future user-added tools are scoped by Discord guild/server. The registry stores non-secret config and credential references, not raw credentials, so one server cannot inherit another server's tools, memory, or secrets."
+        )
+        matched.append("tools")
+
+    if not answers:
+        return None, {"matched": matched}
+
+    deduped = list(dict.fromkeys(answers))
+    return "\n\n".join(deduped)[:1900], {"matched": matched, "answer_count": len(deduped)}
+
+
 async def _project_mempalace_context(prompt: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
     metrics: dict[str, Any] = {
         "enabled": ASK_MEMPALACE_ENABLED and ASK_MEMPALACE_PROJECT_ENABLED,
@@ -2549,16 +2610,60 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
             # The existing n8n workflow already persists chat turns in
             # discord_chat_memory. Avoid double-writing the same prompt/reply here.
             command_started = time.perf_counter()
-            agent_context = None
             metrics: dict[str, Any] = {}
-            if prompt:
-                agent_context, metrics = await _build_agent_context(ctx, prompt)
-            content, n8n_metrics = await _forward_to_n8n(raw_body, agent_context)
-            metrics.update(n8n_metrics)
-            metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
+            content, direct_metrics = _direct_ask_response(prompt)
+            if content:
+                metrics["direct_answer"] = direct_metrics
+                metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
+                await _record_tool_call(
+                    job_id,
+                    "router_direct_ask",
+                    "completed",
+                    input_json={"prompt_chars": len(prompt)},
+                    output_json=metrics,
+                )
+            else:
+                agent_context = None
+                if prompt:
+                    agent_context, metrics = await _build_agent_context(ctx, prompt)
+                try:
+                    content, n8n_metrics = await _forward_to_n8n(raw_body, agent_context)
+                    metrics.update(n8n_metrics)
+                    metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
+                    await _record_tool_call(
+                        job_id,
+                        "n8n_ollama_chat",
+                        "completed",
+                        input_json={
+                            "prompt_chars": len(prompt),
+                            "recent_count": metrics.get("recent_count", 0),
+                            "relevant_count": metrics.get("relevant_count", 0),
+                        },
+                        output_json=metrics,
+                    )
+                except httpx.ReadTimeout:
+                    metrics["total_ms"] = round((time.perf_counter() - command_started) * 1000, 2)
+                    metrics["n8n_status"] = "timeout"
+                    content = (
+                        "The local Ollama chat path timed out before n8n returned. "
+                        "Project/status questions can use the faster router path now; for open-ended chat, try a shorter prompt while we keep tuning latency."
+                    )
+                    await _record_tool_call(
+                        job_id,
+                        "n8n_ollama_chat",
+                        "failed",
+                        input_json={
+                            "prompt_chars": len(prompt),
+                            "recent_count": metrics.get("recent_count", 0),
+                            "relevant_count": metrics.get("relevant_count", 0),
+                        },
+                        output_json=metrics,
+                        error_detail="ReadTimeout",
+                    )
             logger.info(
-                "ask timing job_id=%s memory_ms=%s n8n_ms=%s total_ms=%s recent=%s relevant=%s",
+                "ask timing job_id=%s direct=%s memory_ms=%s n8n_ms=%s total_ms=%s recent=%s relevant=%s",
                 job_id,
+                bool(metrics.get("direct_answer")),
                 metrics.get("memory_ms"),
                 metrics.get("n8n_ms"),
                 metrics.get("total_ms"),
@@ -2566,17 +2671,6 @@ async def _handle_agent_command(payload: dict, raw_body: bytes) -> str:
                 metrics.get("relevant_count"),
             )
             await _update_job_metadata(job_id, {"timing": metrics})
-            await _record_tool_call(
-                job_id,
-                "n8n_ollama_chat",
-                "completed",
-                input_json={
-                    "prompt_chars": len(prompt),
-                    "recent_count": metrics.get("recent_count", 0),
-                    "relevant_count": metrics.get("relevant_count", 0),
-                },
-                output_json=metrics,
-            )
         else:
             content, _ = await _forward_to_n8n(raw_body)
 

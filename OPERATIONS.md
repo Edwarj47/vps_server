@@ -150,6 +150,8 @@ The current memory retrieval is intentionally small and simple to control latenc
 
 MemPalace project facts are intentionally attached only for likely project questions. This keeps normal `/ask` prompts from being polluted by operational context while letting the agent answer stack questions without forcing the user to juggle `/memory`.
 
+The router also has a deterministic fast path for common project/security questions such as current model, `/task`, Codex authority, News Flash, MemPalace gate, schedules, server-scoped tools, and secret requests. These responses bypass n8n/Ollama to avoid slow local inference for facts already controlled by the stack.
+
 The chat model is configured with `OLLAMA_CHAT_MODEL` in `/opt/dcss-n8n/Docker/.env`. Use the sync script below so the `.env`, tracked workflow export, and active n8n workflow records all agree:
 
 ```bash
