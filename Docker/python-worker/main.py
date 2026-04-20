@@ -1468,6 +1468,11 @@ async def _search_mempalace_memory(query: str, source: str = "mempalace") -> str
         return "MemPalace search is disabled."
     if len(query) < 3:
         return "Give me at least 3 characters to search memory."
+    if _looks_like_secret_memory_query(query):
+        return (
+            "I will not reveal secrets from memory. The MemPalace trial imports are sanitized/redacted, "
+            "and secret values should stay in credentials or restricted env files, not Discord memory."
+        )
 
     wing = "project_ops" if source == "project" else None
     cmd = [
@@ -1476,7 +1481,7 @@ async def _search_mempalace_memory(query: str, source: str = "mempalace") -> str
         "search",
         query[:500],
         "--results",
-        "4",
+        "6",
     ]
     if wing:
         cmd.extend(["--wing", wing])
@@ -1515,14 +1520,107 @@ async def _search_mempalace_memory(query: str, source: str = "mempalace") -> str
     if not hits:
         return "No matching MemPalace memory found."
 
-    label = "project_ops" if wing else "MemPalace"
-    lines = [f"{label} memory matches:"]
-    for hit in hits[:4]:
-        text = " ".join(str(hit.get("text") or "").split())
+    label = "Project memory" if wing else "MemPalace memory"
+    lines = [f"{label} matches:"]
+    ranked_hits = sorted(
+        hits,
+        key=lambda hit: (
+            0 if str(hit.get("source_file") or "").endswith(".md") and str(hit.get("room") or "") == "project_facts" else 1,
+            0 if str(hit.get("source_file") or "") == "PROJECT_MEMORY.md" else 1,
+        ),
+    )
+    if wing:
+        terms = _mempalace_query_terms(query)
+        fact_hits = [
+            hit
+            for hit in ranked_hits
+            if str(hit.get("room") or "") == "project_facts"
+            and (not terms or any(term in str(hit.get("text") or "").lower() for term in terms))
+        ]
+        term_hits = [
+            hit
+            for hit in ranked_hits
+            if not terms or any(term in str(hit.get("text") or "").lower() for term in terms)
+        ]
+        if fact_hits:
+            ranked_hits = fact_hits
+        elif term_hits:
+            ranked_hits = term_hits
+    max_hits = 2 if wing else 3
+    for hit in ranked_hits[:max_hits]:
+        text = _format_mempalace_snippet(str(hit.get("text") or ""), query)
         namespace = f"{hit.get('wing', '?')}/{hit.get('room', '?')}"
         similarity = hit.get("similarity")
-        lines.append(f"- {namespace} match={similarity}: {text[:260]}")
+        source_file = str(hit.get("source_file") or "").strip()
+        source_part = f" {source_file}" if source_file else ""
+        lines.append(f"- {namespace}{source_part} match={similarity}: {text[:360]}")
     return "\n".join(lines)[:1900]
+
+
+def _looks_like_secret_memory_query(query: str) -> bool:
+    normalized = query.lower()
+    sensitive_terms = (
+        "secret",
+        "api key",
+        "apikey",
+        "token",
+        "credential",
+        "password",
+        "private key",
+        "webhook_shared_secret",
+        "n8n_webhook_shared_secret",
+        "discord_bot_token",
+    )
+    reveal_terms = ("show", "reveal", "print", "display", "what", "list", "stored")
+    return any(term in normalized for term in sensitive_terms) and any(term in normalized for term in reveal_terms)
+
+
+def _format_mempalace_snippet(text: str, query: str) -> str:
+    cleaned = " ".join(text.split())
+    cleaned = re.sub(r"^#+\s*", "", cleaned)
+    cleaned = re.sub(r"^[a-z]{1,3}:[a-z]+`?;?\s*", "", cleaned, flags=re.I)
+    if cleaned and cleaned[0].islower():
+        boundary = re.search(r"(?<=[.!?])\s+[A-Z`/#]", cleaned[:160])
+        if boundary:
+            cleaned = cleaned[boundary.end() - 1 :].lstrip()
+
+    terms = _mempalace_query_terms(query)
+    lowered = cleaned.lower()
+    indexes = [lowered.find(term) for term in terms if lowered.find(term) >= 0]
+    if indexes:
+        start = max(0, min(indexes) - 120)
+        if start:
+            space = cleaned.find(" ", start)
+            if 0 <= space < start + 40:
+                start = space + 1
+        cleaned = cleaned[start:]
+        if start:
+            cleaned = "... " + cleaned
+
+    return cleaned[:700].strip()
+
+
+def _mempalace_query_terms(query: str) -> list[str]:
+    stop_words = {
+        "what",
+        "does",
+        "right",
+        "with",
+        "from",
+        "that",
+        "this",
+        "stored",
+        "using",
+        "tell",
+        "show",
+        "current",
+        "should",
+    }
+    return [
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9_/-]{4,}", query)
+        if term.lower() not in stop_words
+    ]
 
 
 async def _record_memory_event(ctx: dict[str, str], event_type: str, content: str, metadata: dict | None = None) -> None:

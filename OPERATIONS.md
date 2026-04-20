@@ -204,11 +204,13 @@ Read-only MemPalace trial:
 - Eval tool: `scripts/eval-memory-retrieval.py`
 - Discord test plan: `MEMORY_TEST_PLAN.md`
 - Trial palace: `/opt/dcss-n8n/labs/mempalace/palace-readonly-trial`
-- Latest sanitized Discord import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_092407`
-- Latest project docs import: `/opt/dcss-n8n/labs/mempalace/imports/project-docs-20260420_092443`
-- Latest eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_092510.md`
+- Latest sanitized Discord import: `/opt/dcss-n8n/labs/mempalace/imports/discord-memory-20260420_141726`
+- Latest project docs import: `/opt/dcss-n8n/labs/mempalace/imports/project-docs-20260420_141734`
+- Latest eval: `/opt/dcss-n8n/model-evals/memory-retrieval-eval-20260420_142142.md`
 - The wrapper exposes only `status`, `namespaces`, and `search`. It contains no write, delete, hook, or mutation path.
 - Discord can query the wrapper explicitly through `/memory source:mempalace` or `/memory source:project`; `/ask` does not use MemPalace automatically.
+- `PROJECT_MEMORY.md` holds curated non-secret project facts. The project-docs import splits those facts into the `project_facts` room so Discord gets concise project answers instead of raw manual fragments.
+- Secret-oriented memory searches return a fixed refusal/reminder instead of searching or replaying memory content.
 - Run the wrapper with the MemPalace virtualenv Python:
   `labs/mempalace/.venv/bin/python scripts/mempalace-readonly.py status`
 - Rebuild the trial palace from sanitized Discord memory:

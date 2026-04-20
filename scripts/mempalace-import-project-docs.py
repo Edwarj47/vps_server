@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ DEFAULT_PALACE = STACK_DIR / "labs/mempalace/palace-readonly-trial"
 DEFAULT_IMPORT_ROOT = STACK_DIR / "labs/mempalace/imports"
 MEMPALACE_BIN = STACK_DIR / "labs/mempalace/.venv/bin/mempalace"
 DEFAULT_DOCS = [
+    STACK_DIR / "PROJECT_MEMORY.md",
     STACK_DIR / "AGENTS.md",
     STACK_DIR / "OPERATIONS.md",
 ]
@@ -33,11 +35,34 @@ def _copy_docs(source_dir: Path, docs: list[Path]) -> int:
         resolved = doc.resolve()
         if not resolved.exists() or not resolved.is_file():
             continue
+        if resolved.name == "PROJECT_MEMORY.md":
+            count += _copy_project_memory_sections(source_dir, resolved)
+            continue
         out = source_dir / "project_docs" / resolved.name
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(redact_text(resolved.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
         count += 1
     return count
+
+
+def _copy_project_memory_sections(source_dir: Path, doc: Path) -> int:
+    text = redact_text(doc.read_text(encoding="utf-8", errors="replace"))
+    parts = re.split(r"(?m)^##\s+", text)
+    copied = 0
+    for part in parts[1:]:
+        lines = part.strip().splitlines()
+        if not lines:
+            continue
+        title = lines[0].strip()
+        body = "\n".join(lines[1:]).strip()
+        if not title or not body:
+            continue
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:80] or "fact"
+        out = source_dir / "project_facts" / f"{slug}.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(f"# {title}\n\n{body}\n", encoding="utf-8")
+        copied += 1
+    return copied
 
 
 def main() -> int:
