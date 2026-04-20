@@ -105,8 +105,8 @@ def _write_source_files(rows: list[dict], source_dir: Path) -> None:
     for row in rows:
         by_session.setdefault(str(row.get("session_id") or "unknown"), []).append(row)
 
-    for session_id, items in by_session.items():
-        safe_session = _slug(session_id, "session")
+    for idx, (_session_id, items) in enumerate(sorted(by_session.items()), start=1):
+        safe_session = f"session-{idx:04d}"
         path = source_dir / "discord_chat_memory" / f"{safe_session}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [

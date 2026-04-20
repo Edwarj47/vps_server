@@ -1577,6 +1577,7 @@ def _looks_like_secret_memory_query(query: str) -> bool:
 
 def _format_mempalace_snippet(text: str, query: str) -> str:
     cleaned = " ".join(text.split())
+    cleaned = _redact_memory_display_identifiers(cleaned)
     cleaned = re.sub(r"^#+\s*", "", cleaned)
     cleaned = re.sub(r"^[a-z]{1,3}:[a-z]+`?;?\s*", "", cleaned, flags=re.I)
     if cleaned and cleaned[0].islower():
@@ -1598,6 +1599,13 @@ def _format_mempalace_snippet(text: str, query: str) -> str:
             cleaned = "... " + cleaned
 
     return cleaned[:700].strip()
+
+
+def _redact_memory_display_identifiers(text: str) -> str:
+    redacted = re.sub(r"\bdiscord-\d{16,22}-\d{16,22}-\d{16,22}\b", "[REDACTED_ID]", text)
+    redacted = re.sub(r"\bdiscord:(?:dm:)?\d{16,22}(?::\d{16,22}){0,2}\b", "[REDACTED_ID]", redacted)
+    redacted = re.sub(r"\b\d{17,22}\b", "[REDACTED_ID]", redacted)
+    return redacted
 
 
 def _mempalace_query_terms(query: str) -> list[str]:

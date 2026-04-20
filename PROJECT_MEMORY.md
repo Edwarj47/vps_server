@@ -69,6 +69,6 @@ Other directories should be added only when there is a specific job need.
 ## Secret handling
 
 The memory pipeline redacts likely secrets before sanitized imports. Discord
-memory search must not reveal real API keys, bot tokens, webhook shared
-secrets, environment values, or credentials. Secret-oriented queries should
-return redacted or harmless operational guidance, not secret values.
+memory search should only provide harmless operational guidance for credential
+topics. API keys, bot tokens, webhook shared secrets, environment values, and
+credentials must stay outside Discord-visible memory responses.
